@@ -23,15 +23,18 @@ Modes :
                        qt13) : row_bytes, decoupe tp2, equivalence legacy.
   --hfq FICHIER [--tp N]
                        audit d'un artefact HFQ reel : lecture header+index
-                       (jamais les blobs), verifications par tenseur 2-D des
-                       formats denses (taille de blob vs (m, k, groupe),
-                       k % groupe, champ group_size), classification
-                       G256-exact / G32-only, et decoupe par groupes entiers
-                       equilibree sur tp pour les projections column-parallel
-                       (o_proj, down_proj, out_proj). Les layouts de production
-                       (tetes d'attention, macro-unites Delta) restent cote
-                       Rust (dense_tp_rank_layouts) et sont pinnes par les
-                       tests CPU ; ce script ne les re-derive pas.
+                       (jamais les blobs), affichage de la geometrie du config
+                       (couches, tetes d'attention et GDN, layer_types) pour
+                       collationner les formes locales admises au runtime,
+                       verifications par tenseur 2-D des formats denses
+                       (taille de blob vs (m, k, groupe), k % groupe, champ
+                       group_size), classification G256-exact / G32-only, et
+                       decoupe par groupes entiers equilibree sur tp pour les
+                       projections column-parallel (o_proj, down_proj,
+                       out_proj). Les layouts de production (tetes
+                       d'attention, macro-unites Delta) restent cote Rust
+                       (dense_tp_rank_layouts) et sont pinnes par les tests
+                       CPU ; ce script ne les re-derive pas.
 """
 
 import argparse
@@ -248,6 +251,31 @@ def _scan_metadata(buf, off):
     raise ValueError("unterminated metadata JSON")
 
 
+def geometry_line(config):
+    """Resume de la geometrie du config HFQ (champs de dense_tp_rank_layouts)."""
+    fields = (
+        ("num_hidden_layers", "n_layers"),
+        ("num_attention_heads", "n_heads"),
+        ("num_key_value_heads", "n_kv"),
+        ("head_dim", "head_dim"),
+        ("linear_num_key_heads", "gdn_k_heads"),
+        ("linear_num_value_heads", "gdn_v_heads"),
+        ("linear_key_head_dim", "gdn_key_dim"),
+        ("linear_value_head_dim", "gdn_value_dim"),
+    )
+    parts = [
+        f"{label}={config[key]}"
+        for key, label in fields
+        if config.get(key) is not None
+    ]
+    counts = {}
+    for layer_type in config.get("layer_types") or []:
+        counts[layer_type] = counts.get(layer_type, 0) + 1
+    summary = "+".join(f"{n}x{lt}" for lt, n in counts.items()) or "absent"
+    parts.append(f"layer_types={summary}")
+    return " ".join(parts)
+
+
 def audit_hfq(path, tp):
     version, arch_id, metadata, tensors = read_hfq_index(path)
     config = metadata.get("config", {})
@@ -256,6 +284,7 @@ def audit_hfq(path, tp):
         f"   version={version} arch_id={arch_id} tenseurs={len(tensors)} "
         f"hidden_size={config.get('hidden_size')} intermediate_size={config.get('intermediate_size')}"
     )
+    print(f"   géométrie : {geometry_line(config)}")
     failures = 0
     audited = 0
     g32_only = 0
