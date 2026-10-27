@@ -10150,13 +10150,16 @@ mod dense_tp_preflight_format_tests {
             MQ4_G256_QT | MQ4V2_G256_QT => (256u32, (dim / 256) * 136),
             _ => (0u32, dim * 4),
         };
-        let mut out = vec![tensor(
-            "embed_tokens.weight",
-            vec![VOCAB as u32, dim as u32],
-            embed_qt,
-            embed_group,
-            vec![0u8; VOCAB * embed_bytes],
-        )];
+        let mut out = vec![
+            tensor(
+                "embed_tokens.weight",
+                vec![VOCAB as u32, dim as u32],
+                embed_qt,
+                embed_group,
+                vec![0u8; VOCAB * embed_bytes],
+            ),
+            f32_vector("norm.weight", dim),
+        ];
         if with_lm_head {
             out.push(proj("lm_head.weight", VOCAB, dim, proj_qt, proj_group));
         }
@@ -10358,7 +10361,7 @@ mod dense_tp_preflight_format_tests {
             Err(
                 "preflight: qwen35: qt53 (MQ4G128V2) tensor 'layers.0.linear_attn.in_proj_qkv.weight' \
                  is not supported by dense tensor-parallel loading; load it through the ordinary \
-                 single-device resident or host-mapped path"
+                 single-device resident or host-mapped path (hipError=0)"
                     .to_string()
             )
         );
