@@ -165,7 +165,14 @@ through MTP. Penalties are applied to every verify row.
 
 - **qwen35 dense tensor-parallel mesh (arch 5):** the MTP head is replicated on rank 0 only for
   an explicit `speculation.mtp = on`; `auto` and `off` keep the AR mesh loop. Block-verify
-  drafters (n-gram, DFlash, DSpark) are refused on the mesh.
+  drafters (n-gram, DFlash, DSpark) are refused on the mesh — an explicit n-gram request is
+  refused by name at load (`dense TP: n-gram drafter refused (block verify is not wired on the
+  mesh)`) and stays AR (`crates/hipfire-loader/src/lib.rs`, dense-TP load site). The mesh gate
+  admits MQ4-G256 (`qt13`), MQ4V2 (`qt44`) and Q8_0 (`qt3`) trunks
+  (`crates/hipfire-arch-qwen35/src/qwen35/load.rs`; phases 3-5 of
+  `docs/plans/2026-10-27-qwen35-2gpu-q8-tools-mtp-plan.md`). Head attach and speculative
+  decode verified on hardware (2026-10-27, `qwen3.8-27b` Q8 trunk, tp2, phase 6 of the same
+  plan — capability statement unchanged, no performance claim).
 - **qwen4 / Flash-Next (arch 16):** `Qwen4Carrier` builds a native MTP speculator
   (`hipfire_arch_qwen4::mtp_spec::build_qwen4_mtp_speculator`) when
   `qwen4_native_mtp` admits it (default on because Qwen4 declares a measured AR floor, `MTP_MEASURED_AR_FLOOR = true`, unchanged; off for retained-Redline `.mq4r`; `--spec mtp`

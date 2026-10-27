@@ -1157,6 +1157,22 @@ repetition). The receipt has the EP gate's structure plus `pp`, the bands, the
 transport, each rank's PCI id, arch and PCIe link speed and width
 (`/sys/bus/pci/devices/*/current_link_{speed,width}`) and the host RAM.
 
+### Dense Qwen3.5/3.6 TP: admitted weight formats
+
+The dense-TP loader admits MQ4-G256 (`qt13`), MQ4V2 (`qt44`) and Q8_0 (`qt3`)
+projection tensors on the mesh. Anything else is refused by name — tensor,
+format and mode — never a silent fallback: `dense TP requires qt13, qt44 or
+qt3, got qt=<qt>` (projection validator) and `dense TP2 requires MQ4-G256
+qt13, MQ4V2 qt44 or Q8_0 qt3, <candidate> has qt=<qt>` (preflight); `qt53`
+(MQ4G128V2) stays refused by name, as does any geometry deviation. Q8_0 slices
+per group of 32 where the MQ4 formats slice per group of 256
+(`dense_tp_slice_bytes`); a width that does not divide its group is a refusal.
+The default is unchanged: `mq4` remains the default dense-TP route and `qt3`
+is a capacity, not a switch. On 2x gfx1100 the 27B Q8 trunk was validated end
+to end (decode, long prefill over three chunk regimes, whole-token TP2 graph
+capture, MTP attach and decode — 2026-10-27, phases 3-6 of
+`docs/plans/2026-10-27-qwen35-2gpu-q8-tools-mtp-plan.md`).
+
 ### Dense Qwen3.5/3.6 TP: native MTP
 
 Dense Qwen3.5/3.6 at `tp>1` can speculate with MTP, **opt-in**: only an explicit

@@ -1,10 +1,12 @@
 # Qwen3.5 (arch 5) — 2 GPU + tool_call + MTP en Q8 : plan d'implementation ordonne
 
-**Status:** actif — phases 0, 2, 3, 4, 5 et 6 closes sur materiel (journal et compte rendu plus bas ; phase 4 : slicing par groupe de format ; phase 5 : admission kernels Q8 en decode et prefill long >= 256 tokens ; phase 6 : capture whole-token Q8 rendue observable et attache MTP tp2 — 49.7 tok/s indicatif —, voie AR/auto intacte) ; phases 4-5 avaient ete re-calibrees par le run de cloture de la phase 3 ; reste la parite tp2-vs-mono puis serveur outils et receipt (phase 7) ; phase 1 (spike) ouverte.
+**Status:** actif — phases 0, 2, 3, 4, 5 et 6 closes sur materiel (journal et compte rendu plus bas ; phase 4 : slicing par groupe de format ; phase 5 : admission kernels Q8 en decode et prefill long >= 256 tokens ; phase 6 : capture whole-token Q8 rendue observable et attache MTP tp2 — 49.7 tok/s indicatif —, voie AR/auto intacte) ; phase 1 close (superseedee par les preuves des phases 3-6) ; phase 7 livree cote depot (criteres d'acceptation fixes au journal, protocole de session, docs) — validation GPU en attente (oracle mesh, serve outils, non-regression mq4, receipt de debit) ; phases 8-9 non demarrees.
 **Auteur:** (agent)
 **Cree:** 2026-10-27
-**Specification:** `docs/plans/2026-10-27-qwen35-2gpu-q8-tools-mtp-spec.md` (absente du depot
-au 2026-10-27 : a creer ou rapatrier avant la phase 3)
+**Specification:** `docs/plans/2026-10-27-qwen35-2gpu-q8-tools-mtp-spec.md` — absente du
+depot et non retrouvee (verifie le 2026-10-27, decision avec l'utilisateur) : les criteres
+d'acceptation de la phase 7 sont fixes explicitement a l'entree « Phase 7 LIVREE » du journal
+ci-dessous et au protocole de session.
 
 Ce plan est **ordonne par dependance**, pas par priorite percue : la phase 1 (spike) decide si la
 phase 5 coute peu ou beaucoup, et la phase 2 est la seule entierement parallelisable.
@@ -234,6 +236,64 @@ admission fail-closed ; validation token-exacte PP-MTP vs mono-carte MTP.
 ---
 
 ## Journal d'execution
+
+- **2026-10-27 — Phase 7 LIVREE cote depot (criteres fixes, protocole de session, docs ; validation GPU en attente)** :
+  - Decisions prises avec l'utilisateur (la spec citee par la porte de sortie etant absente du
+    depot et non retrouvee) :
+    - Point 1 (parite mesh-vs-mono) — option (a) : l'oracle existant
+      (`qwen35_tp2_vs_single_oracle`, `qwen35_pp2_vs_single_oracle`) tourne sur la reference
+      mq4-xts scellee (deja la fixture epingulee du harnais, intacte dans models_dir) ; la
+      parite qt3-mono sur le trunk Q8 27B n'est pas mesurable (fit mono `DOES NOT FIT`,
+      phase 2) et est documentee comme telle. Justification : le harnais epingle taille+sha256
+      en dur (`HIPFIRE_QWEN35_FIXTURE` ne surcharge que le chemin), aucun artefact qwen35 qt3
+      n'existe au registre (94 entrees arch 5 : mq3/mq4/mq5/mq6), et le chargement qt3 en
+      route mono n'a jamais ete prouve — l'option (b) (petit artefact qt3) aurait exige un
+      epinglage surchargeable (code + test), un run de quantization et la preuve mono-qt3,
+      hors perimetre phase 7. Le risque numerique residual cote Q8 reste couvert par les
+      phases 3-6 (admission sans refus, determinisme greedy mot a mot, capture whole-token
+      sans etat partiel). L'option (b) reste rejouable independamment de la phase 7.
+    - Point 6 (spec section 5) — criteres d'acceptation fixes explicitement (liste ci-dessous) ;
+      en-tete du plan corrige pour ne plus promettre un fichier fantome.
+    - Phase 1 (spike) — close comme superseedee (entree ci-dessous).
+  - **Criteres d'acceptation de la phase 7 (liste fermee, fixes au 2026-10-27)** :
+    1. Oracle mesh-vs-mono : `qwen35_tp2_vs_single_oracle` vert, 3 processus frais, sur la
+       reference mq4-xts scellee (critere « tokens `assert_eq` + |Δlogit| <= 1.0 »,
+       `BOUND_TP_ABS`), sous flock ; `qwen35_pp2_vs_single_oracle` : 1 processus, complement ;
+       non-mesurabilite qt3-mono sur 27B documentee (fit `DOES NOT FIT`, phase 2).
+    2. Serveur E2E trunk Q8 : `hipfire serve <trunk q8> --tp 2 --spec mtp --max-seq 4096` ;
+       requete `tools` => `finish_reason: "tool_calls"` ; requete `stop` => arret honore sans
+       fuite du texte ; requete hors budget => refus nommant la limite (`request exceeds
+       advertised context window: ...` ou `request exceeds loaded KV budget: ...`, verbatim).
+    3. Non-regression mq4 tp2 : meme harnais sur mq4-xts (serve + tools + stop) + controle AR
+       de decode dans la signature phase 0 (~52 tok/s).
+    4. Docs : `docs/multi-gpu.md` (formats admis TP dense), `docs/speculation-support-inventory.md`
+       (MTP sur mesh dense), `CHANGELOG.md` ; `docs/CONFIG.md` sans modification (aucun message
+       de refus cite).
+    5. Receipt de debit horodate : decode AR + MTP (tg128, 3 processus frais), prefill
+       prompt-a/b/c (`--max-tokens 1`, comptes de tokens reels — ancre trace ~558/1850/3515),
+       avec binaire (version + commit) et identite du modele (chemin + sha256 scelle).
+  - Livre au depot : `docs/multi-gpu.md` (section « Dense Qwen3.5/3.6 TP: admitted weight
+    formats »), `docs/speculation-support-inventory.md` (bullet mesh dense etendu : formats
+    admis, refus n-gram nomme, validation materielle phase 6), `CHANGELOG.md` (entree
+    Unreleased), en-tete et journal du present plan. `docs/CONFIG.md` : non modifie (aucun
+    message de refus cite).
+  - Protocole GPU : `results/session-20261027-phase7/protocole-e2e-tools-receipt.md` (dossier
+    local, non versionne) — etape 0 CPU, oracle mesh (3 processus tp2 + 1 pp2), serve E2E
+    (tools / stop / check max_seq, prompts non vides, chemins absolus), non-regression mq4,
+    receipt de debit ; commandes GPU sous `flock -w 3600 /tmp/hipfire-gpu.lock`.
+  - Porte de sortie : les 5 criteres verts et ce journal a jour => phase 7 close ; la cible
+    « 2 GPU + outils + MTP en Q8 » est alors declaree atteinte. Phases 8 (outils sur PP) et 9
+    (MTP sur mesh PP) non demarrees, conformement au plan.
+
+- **2026-10-27 — Phase 1 CLOSE (superseedee)** : l'objet de la phase 1 (liste exhaustive
+  `(op, M, K, admis/refuse, message)` pour les formes locales Q8 du forward dense-TP) a ete
+  prouve sur materiel par les phases 3-6 : tous les kernels Q8 admis en decode et en prefill
+  long (trois regimes de chunk, phase 5), capture whole-token complete sans etat partiel
+  (phase 6), ensemble de kernels du speculateur MTP admis au vol sans refus. Aucun refus
+  structurel a traiter : la branche « formes refusees => la phase 5 inclut leur admission »
+  n'a jamais ete empruntee. Aucun code ni artefact de spike a rapatrier (la phase 1 n'a rien
+  livre, conformement a son « Interdit ») ; le contenu decisionnel est porte par le journal
+  des phases 3-6. Close sans changement de code.
 
 - **2026-10-27 — Phase 6 CLOSE : capture whole-token Q8 rendue observable + attache MTP tp2, voie AR/auto intacte** :
   - Capture : `HIPFIRE_AR_GRAPH_TRACE=1` rend observable la capture decode-time du graphe
