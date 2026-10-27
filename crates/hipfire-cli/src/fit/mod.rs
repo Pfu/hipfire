@@ -19,7 +19,9 @@ use hipfire_loader::admission::{
     SourceAdmissionOptions, QWEN35_MIN_AUTO_CONTEXT,
 };
 use hipfire_registry::{receipts, ModelEntry, RegistryV1};
+use hipfire_runtime::device_mesh::DimKind;
 use hipfire_runtime::loader_api::{CaskConfig, ModelSource, SpecLoadCfg};
+use hipfire_runtime::mesh_placement::AdmittedMesh;
 use serde::Serialize;
 use serde_json::{json, Value};
 use std::fmt::Write as _;
@@ -34,6 +36,12 @@ pub(crate) struct FitArgs {
     /// Context to admit (otherwise use the same configured/automatic bound as run).
     #[arg(long, value_parser = parse_context)]
     pub ctx: Option<usize>,
+    /// Tensor/expert-parallel degree for the planned load (same admission as `run --tp` / `serve --tp`).
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..=64))]
+    pub tp: Option<u64>,
+    /// Pipeline-parallel degree for the planned load (overrides `topology.pp` for this fit only).
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..=64))]
+    pub pp: Option<u64>,
     /// Do not fetch headers for models that are not installed.
     #[arg(long)]
     pub no_fetch: bool,
@@ -213,6 +221,8 @@ pub(crate) fn fit_command(paths: &crate::Paths, args: FitArgs) -> Result<()> {
         registry,
         &args.model,
         args.ctx,
+        args.tp,
+        args.pp,
         args.no_fetch,
         &machine,
     )?;
@@ -231,7 +241,16 @@ pub(crate) fn fit_command(paths: &crate::Paths, args: FitArgs) -> Result<()> {
                     let machine = &machine;
                     (tag != analysis.model.tag).then(|| {
                         scope.spawn(move || {
-                            analyze_model(paths, registry, tag, args.ctx, args.no_fetch, machine)
+                            analyze_model(
+                                paths,
+                                registry,
+                                tag,
+                                args.ctx,
+                                args.tp,
+                                args.pp,
+                                args.no_fetch,
+                                machine,
+                            )
                         })
                     })
                 })
@@ -382,6 +401,8 @@ fn analyze_model(
     registry: &RegistryV1,
     input: &str,
     ctx: Option<usize>,
+    tp: Option<u64>,
+    pp: Option<u64>,
     no_fetch: bool,
     machine: &FitHost,
 ) -> Result<Analysis> {
@@ -446,7 +467,7 @@ fn analyze_model(
         .ok()
         .map(|m| m.len())
         .or(result.model.size_bytes);
-    let params = match model_params(paths, input, Some(tag), entry, &path, ctx) {
+    let params = match model_params(paths, input, Some(tag), entry, &path, ctx, tp, pp) {
         Ok(params) => params,
         Err(error) => {
             let detail = error.to_string();
@@ -482,7 +503,7 @@ fn analyze_model(
         .or_else(|| source_context(&admitted.source));
     let mut plan = Plan {
         device_index: device.index,
-        topology: topology_key(admitted.topology),
+        topology: topology_key(admitted.topology, &admitted.mesh),
         kv_backend: admitted.kv_backend.as_str().into(),
         kv_backend_reason: admitted.kv_backend_reason.clone(),
         kv_mode: match admitted.sequence.as_ref() {
@@ -524,6 +545,12 @@ fn analyze_model(
         EffectiveTopology::Pipeline(_) | EffectiveTopology::Expert(_) => {
             plan.placement.summary = "per-rank placement decided at load".into();
             plan.placement.decided_at_load = true;
+            if let EffectiveTopology::Expert(_) = admitted.topology {
+                result.notes.push(format!(
+                    "{}: per-rank weights are not projected (the capacity projection is single-card)",
+                    topology_key(admitted.topology, &admitted.mesh)
+                ));
+            }
             result.findings.push(Finding::undetermined(
                 "context",
                 "multi-GPU capacity is sized per rank at load",
@@ -637,6 +664,8 @@ fn model_params(
     entry: Option<&ModelEntry>,
     path: &Path,
     ctx: Option<usize>,
+    tp: Option<u64>,
+    pp: Option<u64>,
 ) -> Result<Value> {
     let resolved = crate::resolved_for_model(paths, input, tag, entry)?;
     let mut params = crate::load_params(
@@ -655,6 +684,12 @@ fn model_params(
     // max_tokens inflation; --ctx has precisely that same precedence.
     if let Some(ctx) = ctx {
         params["max_seq"] = json!(ctx);
+    }
+    if let Some(tp) = tp.filter(|&tp| tp > 1) {
+        params["tp"] = json!(tp);
+    }
+    if let Some(pp) = pp.filter(|&pp| pp > 1) {
+        params["pp"] = json!(pp);
     }
     // daemon/main.rs:1675-1693 and vision_ladder.rs:49-59: sample the
     // developer override ladders outside the pure params mapper, including
@@ -719,10 +754,16 @@ fn source_context(source: &ModelSource) -> Option<usize> {
         .and_then(|v| usize::try_from(v).ok())
 }
 
-fn topology_key(topology: EffectiveTopology) -> String {
+fn topology_key(topology: EffectiveTopology, mesh: &AdmittedMesh) -> String {
     match topology {
         EffectiveTopology::Single => "single".into(),
-        EffectiveTopology::Expert(n) => format!("ep{n}"),
+        EffectiveTopology::Expert(n) => {
+            if mesh.mesh.size_of(DimKind::Tp) > 1 {
+                format!("tp{n}")
+            } else {
+                format!("ep{n}")
+            }
+        }
         EffectiveTopology::Pipeline(n) => format!("pp{n}"),
     }
 }
@@ -1865,5 +1906,55 @@ mod tests {
         let fix = finding.fix.unwrap();
         assert!(fix.contains("hipfire pull example:mq4"));
         assert!(fix.contains("without --no-fetch"));
+    }
+
+    fn mesh_of(axes: &[(DimKind, usize)]) -> AdmittedMesh {
+        AdmittedMesh {
+            mesh: hipfire_runtime::device_mesh::DeviceMesh::rect(axes).unwrap(),
+            ranks: Vec::new(),
+            edges: Vec::new(),
+            family: "test".into(),
+            numerical_policy: "legacy".into(),
+        }
+    }
+
+    #[test]
+    fn topology_key_names_dense_tp_and_expert_parallel_from_the_mesh() {
+        assert_eq!(
+            topology_key(EffectiveTopology::Expert(2), &mesh_of(&[(DimKind::Tp, 2)])),
+            "tp2"
+        );
+        assert_eq!(
+            topology_key(EffectiveTopology::Expert(4), &mesh_of(&[(DimKind::Ep, 4)])),
+            "ep4"
+        );
+        assert_eq!(
+            topology_key(EffectiveTopology::Pipeline(3), &mesh_of(&[(DimKind::Pp, 3)])),
+            "pp3"
+        );
+        assert_eq!(topology_key(EffectiveTopology::Single, &mesh_of(&[])), "single");
+    }
+
+    #[test]
+    fn clap_parses_fit_tp_and_pp_and_rejects_out_of_range() {
+        let cli = crate::Cli::try_parse_from([
+            "hipfire", "fit", "example", "--tp", "2", "--pp", "3",
+        ])
+        .unwrap();
+        let Some(crate::Commands::Fit(args)) = cli.command else {
+            panic!("wrong command")
+        };
+        assert_eq!(args.tp, Some(2));
+        assert_eq!(args.pp, Some(3));
+        for n in ["0", "65"] {
+            assert!(crate::Cli::try_parse_from(["hipfire", "fit", "example", "--tp", n]).is_err());
+            assert!(crate::Cli::try_parse_from(["hipfire", "fit", "example", "--pp", n]).is_err());
+        }
+        let cli = crate::Cli::try_parse_from(["hipfire", "fit", "example"]).unwrap();
+        let Some(crate::Commands::Fit(args)) = cli.command else {
+            panic!("wrong command")
+        };
+        assert_eq!(args.tp, None);
+        assert_eq!(args.pp, None);
     }
 }
