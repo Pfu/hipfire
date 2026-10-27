@@ -1,6 +1,6 @@
 # Qwen3.5 (arch 5) — 2 GPU + tool_call + MTP en Q8 : plan d'implementation ordonne
 
-**Status:** actif — phase 2 validee sur materiel (journal plus bas) ; phase 0 en attente d'execution.
+**Status:** actif — phases 0 et 2 closes sur materiel (journal et compte rendu plus bas) ; phase 1 (spike) et phase 3 (preflight qt3) ouvertes.
 **Auteur:** (agent)
 **Cree:** 2026-10-27
 **Specification:** `docs/plans/2026-10-27-qwen35-2gpu-q8-tools-mtp-spec.md` (absente du depot
@@ -262,6 +262,14 @@ admission fail-closed ; validation token-exacte PP-MTP vs mono-carte MTP.
   `HIPFIRE_PP_DFLASH=1` reste ecarte (precedent du plan : charge accepte, generation sans
   spec-decode cross-card). Le script epingle donc `--spec off` (runs/benchs de mesure) et
   `--spec mtp` (run d'attache MTP) ; `--bench-spec` choisit le mode des benchs.
+- **2026-10-27 — Phase 0 CLOSE, porte de sortie atteinte** (compte rendu scelle :
+  `docs/plans/2026-10-27-qwen35-tp2-phase0-reference.md`, run `20261027T060706Z`) :
+  peer access **oui** (`dense qwen TP load complete: 2 ranks, peer_access=true`) ; artefacts
+  scelles (trunk q8 26.63 GiB, mq4-xts 13.96 GiB, tete MTP 0.21 GiB, sha256 au compte rendu) ;
+  baselines AR (spec off, tg128, 3 processus) : tp2 decode 51.91 tok/s, pp2 decode 44.71 tok/s
+  (+16.1 % pour tp2) ; prefill a reprendre avec un prompt >= 256 tokens (24 tokens par defaut =
+  overhead de lancement) ; attache MTP tp2 operationnelle (compressed-serial K=3, 68.3 tok/s vs
+  51.9 AR sur le run de verification). Les phases 1 et 3 sont debloquees.
 - **Protocole automatise** : `scripts/phase0_reference.py` pilote toute la phase (scellement
   sha256, peer access mq4 tp2, attache MTP, 3 processus frais de bench mq4 tp2 et pp2 via
   `HIPFIRE_TOPOLOGY_PP=2`, fit machine) sous le verrou GPU du plan, et produit
