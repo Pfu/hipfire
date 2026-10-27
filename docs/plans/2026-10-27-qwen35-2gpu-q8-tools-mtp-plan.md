@@ -1,6 +1,6 @@
 # Qwen3.5 (arch 5) — 2 GPU + tool_call + MTP en Q8 : plan d'implementation ordonne
 
-**Status:** actif — phases 0, 2, 3, 4 et 5 closes sur materiel (journal et compte rendu plus bas ; phase 4 : slicing par groupe de format, tests CPU verts et chargement tp2 complet sans erreur de slice ; phase 5 : admission kernels Q8 en decode et prefill long >= 256 tokens, trois runs tp2 sans refus) ; phases 4-5 avaient ete re-calibrees par le run de cloture de la phase 3 (slicing et admission kernels deja fonctionnels sur l'artefact cible G256) ; reste la parite tp2-vs-mono (phase 7) ; phase 1 (spike) ouverte.
+**Status:** actif — phases 0, 2, 3, 4, 5 et 6 closes sur materiel (journal et compte rendu plus bas ; phase 4 : slicing par groupe de format ; phase 5 : admission kernels Q8 en decode et prefill long >= 256 tokens ; phase 6 : capture whole-token Q8 rendue observable et attache MTP tp2 — 49.7 tok/s indicatif —, voie AR/auto intacte) ; phases 4-5 avaient ete re-calibrees par le run de cloture de la phase 3 ; reste la parite tp2-vs-mono puis serveur outils et receipt (phase 7) ; phase 1 (spike) ouverte.
 **Auteur:** (agent)
 **Cree:** 2026-10-27
 **Specification:** `docs/plans/2026-10-27-qwen35-2gpu-q8-tools-mtp-spec.md` (absente du depot
@@ -234,6 +234,52 @@ admission fail-closed ; validation token-exacte PP-MTP vs mono-carte MTP.
 ---
 
 ## Journal d'execution
+
+- **2026-10-27 — Phase 6 CLOSE : capture whole-token Q8 rendue observable + attache MTP tp2, voie AR/auto intacte** :
+  - Capture : `HIPFIRE_AR_GRAPH_TRACE=1` rend observable la capture decode-time du graphe
+    whole-token (deja engagee par defaut sur la paire exacte gfx1100 tp2, `HIPFIRE_TP_FULL_GRAPH`
+    unset, mais muette depuis la phase 3) — une ligne par processus, au premier token propre :
+    `[qwen-dense-tp-graph] captured whole-token tp=2 barriers=128 pos=560` (prompt-a) puis
+    `pos=12` ("Hello") ; aucun `TP2 whole-token graph state is partial`, aucun fallback, aucun
+    refus, sorties coherentes (43.5 et 44.0 tok/s). Contre-epreuve `HIPFIRE_TP_FULL_GRAPH=0`
+    (route segmentee) non jouee — optionnelle au protocole.
+  - Attache MTP : apres restoration de la tete scellee — supprimee du disque pendant la
+    session (un lien `.q8.mtp` devenu casse a produit un refus fail-closed colate :
+    `MTP head required (mtp=on) but not loaded: no bundled trailer or .mtp sidecar found`,
+    rollback propre avant upload des poids) — `hipfire pull qwen3.8:27b-mq4-xts --yes --ple
+    none` a rapatrie `qwen3.8-27b.mtp` au sha256 exact du scelle phase 0 (les 13 tiers du
+    registre declarant la meme tete ; le trunk mq4-xts present n'a pas ete re-telecharge) et
+    le lien `<trunk>.mtp` redevient valide. Les trois logs d'attache attendus sont presents
+    verbatim (`MTP head loaded (sidecar ..., dense TP rank 0): n_embd=5120 vocab=248320`,
+    `qwen35 MTP speculator enabled (compressed-serial, K=3)`, `qwen35 MTP prompt fill route:
+    ar (AR prefill route)`) et le decode speculatif tourne : `[req run] drafter=mtp tau=2.00
+    tok/s=49.7 decode (108 tok, 36 windows)` — 3.0 tok/fenetre (1 trunk + 2.0 drafts acceptes
+    de 3), +14-15 % vs AR 43.2-43.6 (indicatif, prompt vide ; receipt phase 7 ; phase 0 sur
+    mq4-xts : +31.6 %). Nouvel ensemble de kernels du speculateur admis au vol sans refus
+    (tete mq4-G256 : gemm_hfq4g256, gemv_hfq4g256_rdna3, mq_rotate_x, fused_*_mq_rotate,
+    argmax_token_chain, argmax_f32_batched, greedy_accept, dflash_gdn_pre,
+    dflash_state_bulk_copy, gemm_q8_0_wmma, kv_cache_write_q8_0_batched).
+  - Voie AR/auto intacte : defaut (auto) — AUCUNE ligne MTP ; observable nouveau, explique par
+    le code : `  dense TP: n-gram drafter refused (block verify is not wired on the mesh)`
+    (`crates/hipfire-loader/src/lib.rs:5405-5414` — le site de chargement dense-TP force
+    `ngram_draft: Some(false)` et refuse nommement le bras n-gram ; DFlash est passe None en
+    dur sur le mesh, d'ou l'absence du refus DFlash v1 attendu d'apres la phase 0 : sur le
+    mesh dense-TP, le defaut ne peut qu'etre AR). Controle AR `--spec off` "Hello" : 54 tok @
+    44.0 tok/s — la signature des clotures 3/4. Determinisme greedy : la reponse a prompt-a
+    est identique mot a mot en AR trace, en auto (n-gram refuse) et au run phase 5.
+  - Collation comptes de tokens (correction du protocole phase 5) : la trace de capture ancre
+    prompt-a a ~557-559 tokens (462 mots ≈ 1.21 tok/mot) — les estimations phase 5
+    (~350/1150/2200, ratio inverse) etaient sous-comptees d'un facteur ~1.6 : regimes corriges
+    ≈558 (chunk partiel), ≈1850 (1 plein + tail), ≈3515 (3 pleins + tail, et non 2) pour les
+    runs phase 5 ; l'admission par hauteur de chunk reste acquise.
+  - Contexte artefacts : trunk et tete vivent desormais dans models_dir (`qwen3.8-27b.q8.hfq`,
+    lien `qwen3.8-27b.q8.mtp` -> tete scellee) ; la reference `qwen3.8-27b.mq4-xts` est
+    intacte (non-regression mq4 de la phase 7). Aucun changement de code, aucun test ajoute
+    (memes raisons que la phase 5) ; chemins MQ4 intouches (filtres verts phase 5).
+  - Transcriptions : `results/session-20261027-phase6/` (dossier local, non versionne). Porte
+    de sortie atteinte (« un decode MTP fonctionne sur trunk Q8 en tp2, avec le log d'attache
+    attendu ; la voie AR reste intacte ») → phase 7 (parite tp2-vs-mono, serveur outils, docs,
+    receipt) debloquee.
 
 - **2026-10-27 — Phase 5 CLOSE : admission kernels Q8 en decode et prefill long sur materiel** :
   trois runs `run /home/spf/qwen3.8-27b.q8.hfq --tp 2 --max-seq 4096 --temp 0 --spec off` sous le
