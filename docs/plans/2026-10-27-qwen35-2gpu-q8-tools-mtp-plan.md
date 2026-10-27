@@ -253,3 +253,8 @@ admission fail-closed ; validation token-exacte PP-MTP vs mono-carte MTP.
 - **Artefacts de phase 0 identifies** (dans `registry/v1.json`, arch 5) : trunk q8 local
   `qwen3.8-27b.q8.hfq` ; reference mq4 du registre `qwen3.8:27b` -> `qwen3.8-27b.mq4` avec tete
   MTP sidecar `qwen3.8-27b.mtp`. A telecharger et sceller (sha256) a l'execution de la phase 0.
+- **Protocole automatise** : `scripts/phase0_reference.py` pilote toute la phase (scellement
+  sha256, peer access mq4 tp2, attache MTP, 3 processus frais de bench mq4 tp2 et pp2 via
+  `HIPFIRE_TOPOLOGY_PP=2`, fit machine) sous le verrou GPU du plan, et produit
+  `phase0-out/run-<ts>/report.md` + `summary.json` + logs bruts + JSON bench. `--dry-run`
+  affiche les commandes sans les executer ; `--skip-pull` evite de re-puller.
