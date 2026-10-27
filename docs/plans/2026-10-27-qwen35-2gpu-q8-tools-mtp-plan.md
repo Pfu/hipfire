@@ -1,6 +1,6 @@
 # Qwen3.5 (arch 5) — 2 GPU + tool_call + MTP en Q8 : plan d'implementation ordonne
 
-**Status:** actif — phases 0, 2 et 3 closes sur materiel (journal et compte rendu plus bas) ; phase 4 livree (slicing par groupe de format + tests CPU ; validation materielle en attente) ; phases 4-5 re-calibrees par le run de cloture de la phase 3 (slicing et admission kernels deja fonctionnels sur l'artefact cible G256 ; restent le prefill long >= 256 tokens et la parite tp2-vs-mono) ; phase 1 (spike) ouverte.
+**Status:** actif — phases 0, 2 et 3 closes sur materiel (journal et compte rendu plus bas) ; phase 4 close sur materiel (slicing par groupe de format : tests CPU verts, chargement tp2 complet sans erreur de slice) ; phases 4-5 re-calibrees par le run de cloture de la phase 3 (slicing et admission kernels deja fonctionnels sur l'artefact cible G256 ; restent le prefill long >= 256 tokens et la parite tp2-vs-mono) ; phase 1 (spike) ouverte.
 **Auteur:** (agent)
 **Cree:** 2026-10-27
 **Specification:** `docs/plans/2026-10-27-qwen35-2gpu-q8-tools-mtp-spec.md` (absente du depot
@@ -269,6 +269,19 @@ admission fail-closed ; validation token-exacte PP-MTP vs mono-carte MTP.
     du trunk q8 doit rester identique (artefact tout-G256 : slicing G32 equivalent a G256, verifie
     par test et par le script) ; prefill long (>= 256 tokens, chunks WMMA reels) et parite
     tp2-vs-mono restent l'objet des phases 5 et 7.
+  - **2026-10-27 — Tests CPU verts sur materiel** (runs `results/run-20261027T091026Z` — filtre
+    `dense_tp` : 28 passed / 0 failed, 435 filtered — et `results/run-20261027T091207Z` — lib
+    complete : 438 passed / 0 failed / 25 ignored, les memes seams GPU qu'au run de la porte qt3 ;
+    commit `cbf3cdf78`, rustc/cargo 1.101.0-nightly) : compilation sans warning ni erreur (la
+    suppression de `is_dense_proj_qt` ne laisse aucun code mort). Porte de sortie CPU atteinte.
+  - **2026-10-27 — Phase 4 CLOSE : chargement par rang sans erreur de slice** (run tp2 du trunk q8
+    sous le verrou du plan, daemon isole via `HIPFIRE_DAEMON_BIN=$PWD/target/release/daemon` ; le
+    canari confirme le daemon du build local a jour — l'installation `~/.hipfire/bin/daemon` reste
+    perimee, remede durable `hipfire update` toujours en attente) : load complet (`dense qwen TP
+    load complete: 2 ranks, peer_access=true`, tape whole-token 128 barriers, KV Q8 VMM par rang,
+    51.88 GB lus), prefill + decode 54 tok @ 43.9 tok/s (identique a la cloture precedente —
+    attendu : slicing G32 equivalent a G256 sur artefact tout-G256, pinne par test et par le
+    script), sortie textuelle coherente. Aucun fallback silencieux, aucun refus.
 
 - **2026-10-27 — Phase 3 livree (code + tests CPU ; validation CPU/GPU en attente)** :
   - `validate_mq4_proj_info` -> `validate_dense_proj_info` (`crates/hipfire-arch-qwen35/src/qwen35/load.rs`) :
