@@ -1,6 +1,6 @@
 # Qwen3.5 (arch 5) — 2 GPU + tool_call + MTP en Q8 : plan d'implementation ordonne
 
-**Status:** actif — phases 0, 2 et 3 closes sur materiel (journal et compte rendu plus bas) ; phase 4 close sur materiel (slicing par groupe de format : tests CPU verts, chargement tp2 complet sans erreur de slice) ; phases 4-5 re-calibrees par le run de cloture de la phase 3 (slicing et admission kernels deja fonctionnels sur l'artefact cible G256 ; restent le prefill long >= 256 tokens et la parite tp2-vs-mono) ; phase 1 (spike) ouverte.
+**Status:** actif — phases 0, 2, 3, 4 et 5 closes sur materiel (journal et compte rendu plus bas ; phase 4 : slicing par groupe de format, tests CPU verts et chargement tp2 complet sans erreur de slice ; phase 5 : admission kernels Q8 en decode et prefill long >= 256 tokens, trois runs tp2 sans refus) ; phases 4-5 avaient ete re-calibrees par le run de cloture de la phase 3 (slicing et admission kernels deja fonctionnels sur l'artefact cible G256) ; reste la parite tp2-vs-mono (phase 7) ; phase 1 (spike) ouverte.
 **Auteur:** (agent)
 **Cree:** 2026-10-27
 **Specification:** `docs/plans/2026-10-27-qwen35-2gpu-q8-tools-mtp-spec.md` (absente du depot
@@ -234,6 +234,50 @@ admission fail-closed ; validation token-exacte PP-MTP vs mono-carte MTP.
 ---
 
 ## Journal d'execution
+
+- **2026-10-27 — Phase 5 CLOSE : admission kernels Q8 en decode et prefill long sur materiel** :
+  trois runs `run /home/spf/qwen3.8-27b.q8.hfq --tp 2 --max-seq 4096 --temp 0 --spec off` sous le
+  verrou du plan, daemon installe a jour (plus de `HIPFIRE_DAEMON_BIN`), artefact scelle en
+  phase 0 — en lieu et place du run unique + 3 benchs du protocole : trois longueurs de prompt
+  croissantes couvrent les memes regimes de chunk (cap tp2 = 1024 tokens, `prefill_max_batch_tp`
+  = 512*2) avec un decode reel en plus. Aucun refus, aucune ligne `unsupported`, aucun fallback
+  silencieux ; `hipfire load_phases.v1` nominale a chaque run (~26.9 s, 50.97 GB lus, 0 major
+  fault) ; meme ensemble de paquets de kernels indexes verifies qu'aux clotures de phases 3/4,
+  en decode ET en prefill (embedding_q8_batched, rmsnorm, gemm_qkvza_q8_0_wmma,
+  gated_delta_net_q8_fast, gemm_q8_0_residual_wmma, gemm_gate_up_q8_0_wmma, gemm_qkv_q8_0_wmma,
+  attention_q8_0_flash_prefill_wmma_gfx11_hd256, attention_flash_q8_0_tile/reduce, gemv_q8_0,
+  conv/rope/silu/gated_norm et helpers).
+  - run a (prompt-a.txt, 462 mots, ~350 tokens estimes — chunk partiel attendu) : 1870 tok @
+    43.6 tok/s ; collation exacte de la structure du prompt par le modele (7 paragraphes de 4
+    phrases, le dernier a 3 — verifie dans le fichier) et des details cites (trip count, lime
+    content, shutters, offset in his log — tous presents ; deux fragments cites paraphrases,
+    absents des trois prompts, sans portee).
+  - run b (prompt-b.txt, 1533 mots, ~1100-1180 estimes — 1 chunk plein + tail attendus) :
+    852 tok @ 43.4 tok/s ; le modele decrit la boucle du texte et elle est exacte (l'ouverture
+    « The harbor lights flickered twice » apparait 2 fois, fin sur les rain barrels — verifie
+    dans le fichier).
+  - run c (prompt-c.txt, 2916 mots, ~2100-2200 estimes — 2 chunks pleins + tail attendus) :
+    extension du mapping KV pendant le prefill (`mapped_prefix=3855->4096 / physical_cap=4096`),
+    496 tok @ 43.2 tok/s, reponse coherente sur le contenu du prompt long (collation partielle :
+    transcription tronquee ; decompte « roughly sixty » du modele non colle au decompte
+    mecanique — sans portee sur l'admission).
+  - Comptes de tokens estimes (pas de tokenizer cote agent) ; les logs des runs n'impriment pas
+    les bornes de chunk : l'observable dur est trois prefills longs (>= 256 tokens estimes)
+    sans aucun refus, dont deux superieurs au cap de chunk estime (1024).
+  - Complements CPU : audit `scripts/phase4_slice_arithmetic.py --hfq` — 498 tenseurs denses
+    verifies, 0 hors G256, 0 echec ; `cargo test -p hipfire-arch-qwen35` et filtres `qt13` /
+    `qt44` / `dense_tp` verts — chemins MQ4 intouches (point 3 du travail demande).
+  - Aucun test cible par op ajoute : aucun code de production n'a change en phase 5 (l'admission
+    est un fait d'execution GPU observable dans les logs, pas une surface de code nouvelle) ;
+    seams GPU existantes inchangees.
+  - Benchs `--prompt-file --max-tokens 1` non executes : la mesure de debit prefill
+    (`prefill_tok_s`, comptes de tokens reels) reste l'objet de la phase 7 (receipt).
+  - Debits indicatifs AR (spec off) : 43.2-43.6 tok/s, en ligne avec les clotures 3/4
+    (43.8-44.0) ; baseline mq4 tp2 51.91 tok/s.
+  - Transcriptions : `results/session-20261027-phase5/gpu-run-{a,b,c}.md` (dossier local, non
+    versionne). Porte de sortie atteinte (« un run decode et un run prefill complets sur un
+    trunk q8 en --tp 2, sans erreur d'admission, sur formes reelles ») → phase 6 (graphe TP2 +
+    attache MTP sur trunk Q8) debloquee.
 
 - **2026-10-27 — Phase 4 livree (slicing par groupe de format ; validation CPU/GPU en attente)** :
   - `dense_tp_slice_bytes` (nouveau, pur, `crates/hipfire-arch-qwen35/src/qwen35/load.rs`) :
