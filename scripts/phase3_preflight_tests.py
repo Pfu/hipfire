@@ -205,14 +205,21 @@ def parse_cargo_diagnostics(stderr: str) -> dict[str, Any]:
     }
 
 
-def parse_libtest(stdout: str) -> dict[str, Any]:
-    headers = list(SUITE_HEADER_RE.finditer(stdout))
+def parse_libtest(stdout: str, stderr: str) -> dict[str, Any]:
+    # Cargo ecrit les entetes de suites ("Running unittests ...", "Doc-tests ...")
+    # sur stderr et la sortie des binaires de test ("running N tests" ...
+    # "test result: ...") sur stdout ; suites appariees par ordre d'execution.
+    suite_headers = [match.group(1).strip() for match in
+                     SUITE_HEADER_RE.finditer(stderr)]
+    section_starts = [match.start() for match in
+                      re.finditer(r"^running\s+\d+\s+tests\s*$", stdout, re.MULTILINE)]
     suites: list[TestSuite] = []
-    for index, match in enumerate(headers):
-        start = match.end()
-        end = headers[index + 1].start() if index + 1 < len(headers) else len(stdout)
+    for index, start in enumerate(section_starts):
+        end = section_starts[index + 1] if index + 1 < len(section_starts) else len(stdout)
         body = stdout[start:end]
-        suite = TestSuite(header=match.group(0).strip())
+        suite = TestSuite(
+            header=(suite_headers[index] if index < len(suite_headers)
+                    else f"suite {index + 1} (nom non determine)"))
         result = RESULT_LINE_RE.search(body)
         if result is not None:
             suite.result = result.group(1)
@@ -363,12 +370,16 @@ def print_paste_block(context: dict[str, Any]) -> None:
             for failure in parsed["failures"]:
                 first = failure["output"].splitlines()[0] if failure["output"] else ""
                 print(f"  - {failure['name']}: {first}")
+        if not parsed["suites"] and context["tests_step"].get("stderr_tail"):
+            print("sortie cargo (stderr, fin) :")
+            for line in context["tests_step"]["stderr_tail"]:
+                print(f"  {line}")
         print(f"skips   : {parsed['skip_total']} "
               f"({json.dumps(parsed['skip_counts'], ensure_ascii=True)})")
     global_status = "OK" if context["all_ok"] else "ECHEC"
     print(f"statut  : {global_status}")
-    print(f"detail  : {context['run_dir'] / 'report.md'} ; "
-          f"{context['run_dir'] / 'summary.json'}")
+    run_dir_path = Path(context['run_dir'])
+    print(f"detail  : {run_dir_path / 'report.md'} ; {run_dir_path / 'summary.json'}")
     print("=" * 68)
 
 
@@ -401,7 +412,8 @@ def main() -> int:
     def quick(name: str, cmd: list[str]) -> tuple[StepResult, str]:
         log = logs_dir / f"{name}.log"
         step = run_step(args, name, cmd, log, use_flock=False)
-        return step, full_log(log)
+        stdout, _ = split_log_sections(step.log_path)
+        return step, stdout
 
     git_step, git_text = quick("git-rev",
                                ["git", "-C", str(REPO_ROOT), "rev-parse", "--short", "HEAD"])
@@ -468,7 +480,7 @@ def main() -> int:
     tests_step = run_step(args, "run-tests", test_cmd, logs_dir / "tests.log",
                           use_flock=True)
     tests_stdout, tests_stderr = split_log_sections(tests_step.log_path)
-    parsed = parse_libtest(tests_stdout) if not args.dry_run else {
+    parsed = parse_libtest(tests_stdout, tests_stderr) if not args.dry_run else {
         "suites": [], "failures": [], "skip_total": 0, "skip_counts": {},
         "skip_lines": [], "preflight_mod": {"total": 0, "ok": 0},
         "totals": {"passed": 0, "failed": 0, "ignored": 0, "suites": 0}}
