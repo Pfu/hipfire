@@ -80,6 +80,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tg", type=int, default=128, help="tokens de decode par run bench (defaut 128)")
     parser.add_argument("--max-seq", type=int, default=4096, help="contexte des runs de peer access")
     parser.add_argument("--prompt", default="Hello", help="prompt des runs de peer access")
+    parser.add_argument("--bench-prompt-file", type=Path, default=None,
+                        help="fichier prompt (>=256 tokens) pour un tok/s de prefill reel ; "
+                             "sinon le prompt court du bench ne mesure que l'overhead de lancement")
     parser.add_argument("--bench-spec", default="off",
                         help="mode de speculation des benchs (defaut off = AR pur, "
                              "passez mtp pour la voie outils+MTP) ; les runs de peer access "
@@ -164,6 +167,22 @@ def gib(value: Any) -> str:
 def models_dir() -> Path:
     home = os.environ.get("HIPFIRE_HOME")
     return (Path(home).expanduser() if home else Path.home() / ".hipfire") / "models"
+
+
+def find_value(obj: Any, key: str) -> Any:
+    if isinstance(obj, dict):
+        if key in obj:
+            return obj[key]
+        for value in obj.values():
+            found = find_value(value, key)
+            if found is not None:
+                return found
+    elif isinstance(obj, list):
+        for value in obj:
+            found = find_value(value, key)
+            if found is not None:
+                return found
+    return None
 
 
 def find_topology(obj: Any) -> Any:
@@ -406,7 +425,7 @@ def main() -> int:
             mq4_name = mq4_name or entry.get("file")
             mtp_block = entry.get("mtp")
             mtp_name = mtp_name or (mtp_block.get("file") if isinstance(mtp_block, dict) else None)
-            repo = entry.get("repo") or ""
+            repo = entry.get("repo") or find_value(entry, "repo") or ""
     mq4_path = (models_dir() / mq4_name) if mq4_name else None
     if mtp_name is None and mq4_name:
         mtp_name = str(Path(mq4_name).with_suffix(".mtp"))
@@ -453,6 +472,26 @@ def main() -> int:
             print(f"[{status}] {name}: {artifact['path']}")
 
     model_arg = str(mq4_path) if mq4_path else str(models_dir() / f"<fichier de {args.mq4_tag}>")
+
+    fit_report: dict[str, Any] = {}
+    if not args.dry_run:
+        fit_step = run_step(args, "fit-mq4-tp2",
+                            [str(hipfire), "fit", model_arg, "--tp", "2", "-j"],
+                            logs_dir / "fit-mq4-tp2.json.log", acceptable_exits=(0, 1, 2))
+        steps.append(fit_step)
+        if fit_step.ok:
+            stdout = log_stdout(fit_step.log_path).strip()
+            if stdout:
+                parsed_fit = json.loads(stdout)
+                fit_report = fit_machine(parsed_fit)
+                verdict = parsed_fit.get("verdict")
+                if verdict is not None:
+                    fit_step.detail = f"verdict={verdict} (exit fit {fit_step.exit_code})"
+    if not fit_report:
+        fit_report = {"devices": [], "ram_total": "n/a", "mem_available": "n/a",
+                      "plan_topology": "n/a"}
+
+    partials = sorted(models_dir().glob("*.part.*")) if not args.dry_run else []
     def run_command_for(spec: str) -> list[str]:
         return [str(hipfire), "run", model_arg, "--tp", "2", "--max-seq", str(args.max_seq),
                 "--temp", "0", "--spec", spec, args.prompt]
@@ -483,6 +522,8 @@ def main() -> int:
             bench_log = logs_dir / f"bench-mq4-{config}-{index}.log"
             bench_cmd = [str(hipfire), "bench", model_arg, "--spec", args.bench_spec,
                          "--tg", str(args.tg), "-j"]
+            if args.bench_prompt_file:
+                bench_cmd += ["--prompt-file", str(args.bench_prompt_file.expanduser())]
             step = run_step(args, f"bench-mq4-{config}-{index}", bench_cmd, bench_log,
                             env_extra=env_extra)
             steps.append(step)
@@ -496,25 +537,6 @@ def main() -> int:
         pool_prefill = pooled([value for run in runs for value in (run.get("prefill_samples") or [])])
         baselines[config] = {"runs": runs, "pool_decode": pool_decode, "pool_prefill": pool_prefill}
 
-    fit_report: dict[str, Any] = {}
-    if not args.dry_run:
-        fit_step = run_step(args, "fit-mq4-tp2",
-                            [str(hipfire), "fit", model_arg, "--tp", "2", "-j"],
-                            logs_dir / "fit-mq4-tp2.json.log", acceptable_exits=(0, 1, 2))
-        steps.append(fit_step)
-        if fit_step.ok:
-            stdout = log_stdout(fit_step.log_path).strip()
-            if stdout:
-                parsed_fit = json.loads(stdout)
-                fit_report = fit_machine(parsed_fit)
-                verdict = parsed_fit.get("verdict")
-                if verdict is not None:
-                    fit_step.detail = f"verdict={verdict} (exit fit {fit_step.exit_code})"
-    if not fit_report:
-        fit_report = {"devices": [], "ram_total": "n/a", "mem_available": "n/a",
-                      "plan_topology": "n/a"}
-
-    partials = sorted(models_dir().glob("*.part.*")) if not args.dry_run else []
     log_files = sorted(logs_dir.glob("*.log")) if logs_dir.is_dir() else []
     all_logs = "\n".join(path.read_text() for path in log_files)
     anomalies = sorted(set(anomaly_lines(all_logs)))
