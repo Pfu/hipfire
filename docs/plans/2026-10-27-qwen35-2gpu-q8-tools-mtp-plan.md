@@ -262,6 +262,12 @@ admission fail-closed ; validation token-exacte PP-MTP vs mono-carte MTP.
   - Reste a valider : `cargo test -p hipfire-arch-qwen35` (cote utilisateur), puis sur GPU que
     le q8 passe la porte de format (peut encore echouer plus loin — slicing phase 4, admission
     kernels phase 5).
+  - Protocole automatise : `scripts/phase3_preflight_tests.py` pilote la compilation
+    (`cargo test -p hipfire-arch-qwen35 --no-run`) puis l'execution des tests (avec
+    `--show-output` pour rendre les skips runtime comptables), sous le verrou GPU du plan,
+    et produit `phase3-out/run-<ts>/report.md` + `summary.json` + logs bruts ; `--lib-only`
+    limite l'execution aux tests unitaires de la lib (aucun GPU), `--filter` passe un filtre
+    de nom de test, `--dry-run` affiche les commandes sans les executer.
 
 - **2026-10-27 — Phase 2 validee sur materiel** (implementation `af4cb2f62` ; 2x gfx1100 24 GiB,
   PCIe 28.3 GB/s calibre, hote 123.4 GiB RAM, artefact `qwen3.8-27b.q8.hfq` 26.6 GiB arch 5,
