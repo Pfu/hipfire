@@ -1,6 +1,6 @@
 # Qwen3.5 (arch 5) — 2 GPU + tool_call + MTP en Q8 : plan d'implementation ordonne
 
-**Status:** actif — phases 0 et 2 closes sur materiel (journal et compte rendu plus bas) ; phase 1 (spike) et phase 3 (preflight qt3) ouvertes.
+**Status:** actif — phases 0 et 2 closes sur materiel (journal et compte rendu plus bas) ; phase 3 (preflight qt3) livree (code + tests CPU, a compiler et a valider sur GPU) ; phase 1 (spike) ouverte.
 **Auteur:** (agent)
 **Cree:** 2026-10-27
 **Specification:** `docs/plans/2026-10-27-qwen35-2gpu-q8-tools-mtp-spec.md` (absente du depot
@@ -234,6 +234,34 @@ admission fail-closed ; validation token-exacte PP-MTP vs mono-carte MTP.
 ---
 
 ## Journal d'execution
+
+- **2026-10-27 — Phase 3 livree (code + tests CPU ; validation CPU/GPU en attente)** :
+  - `validate_mq4_proj_info` -> `validate_dense_proj_info` (`crates/hipfire-arch-qwen35/src/qwen35/load.rs`) :
+    validateur de projection par format — MQ4 inchange (groupe 256, `(k/256)*136`, messages
+    `group_size must be 256` / `shape mismatch` / `K={k} not multiple of 256` / `blob length
+    mismatch` verbatim), Q8_0 admis (qt=3, groupe 32, `(k/32)*34`, `k % 32 == 0`, messages
+    `Q8 group_size must be 32` / `K={k} not multiple of 32`). `expected_mq4_bytes` reste
+    (wrapper de la nouvelle `expected_grouped_bytes` ; `validate_embedding_info` inchange) ;
+    `is_dense_proj_qt` delegue a `dense_proj_format` — qt3 passe les deux portes de format
+    (preflight et `load_weight_tensor_dense_tp`, dont le message cite maintenant les trois
+    formats admis ; textes de porte absents de `docs/load-refusal-wording.md`, verifie par grep).
+  - Alignements geometriques du preflight (`K=... not G... aligned`, `o_in`, `hidden`)
+    parametres par le groupe du format des tenseurs concernes : texte MQ4 identique au
+    caractere pres (`not G256 aligned`), Q8_0 exige 32.
+  - Fail-closed : qt53 refuse aux deux niveaux (message `reject_hfq_qt53_for_mode` verbatim,
+    plus le refus du validateur direct), deviations de geometrie refusees, aucun fallback
+    silencieux. Le slicing par rang reste groupe-256 en dur (phase 4) : un q8 peut passer la
+    porte de format puis echouer au slice — refuse explicitement par `slice_uniform_group_cols`.
+  - Tests CPU purs (`mod dense_tp_preflight_format_tests`, fixtures HFQ minuscules ecrites avec
+    `write_hfqm_package_mem` du runtime, geometrie compatible `dense_tp_rank_layouts` tp2 :
+    hidden 512, 8 Q heads, Delta 4x4 tetes value_dim 128, 1 couche linear_attention + 1
+    full_attention) : qt3 accepte (embed+lm_head qt3), qt13/qt44 acceptent, qt3 refuse
+    `k % 32 != 0` et `group_size != 32`, qt53 refuse (preflight et validateur direct), messages
+    MQ4 pinnes (group_size, shape, blob, K multiple de 256), porte de format nommant les trois
+    formats. Doc de l'exemple `bench_dflash_verify_shapes.rs` mis a jour vers le symbole renomme.
+  - Reste a valider : `cargo test -p hipfire-arch-qwen35` (cote utilisateur), puis sur GPU que
+    le q8 passe la porte de format (peut encore echouer plus loin — slicing phase 4, admission
+    kernels phase 5).
 
 - **2026-10-27 — Phase 2 validee sur materiel** (implementation `af4cb2f62` ; 2x gfx1100 24 GiB,
   PCIe 28.3 GB/s calibre, hote 123.4 GiB RAM, artefact `qwen3.8-27b.q8.hfq` 26.6 GiB arch 5,
