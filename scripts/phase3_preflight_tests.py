@@ -58,10 +58,10 @@ LOAD_GATE_SIGNATURE = b"MQ4V2 qt44 or Q8_0 qt3"
 # ~/.hipfire/bin/ AVANT target/release — un daemon installe perime prime).
 # "repo" = racine du depot ; "install" = racine d'installation (HIPFIRE_HOME).
 BINARY_CHECKS = (
-    ("repo", "target/release/hipfire", "cli du build local"),
-    ("repo", "target/release/daemon", "daemon du build local"),
-    ("install", "bin/hipfire", "cli installe"),
-    ("install", "bin/daemon", "daemon installe (prioritaire sur le build local)"),
+    ("repo", "target/release/hipfire", "cli du build local", False),
+    ("repo", "target/release/daemon", "daemon du build local", True),
+    ("install", "bin/hipfire", "cli installe", False),
+    ("install", "bin/daemon", "daemon installe (prioritaire sur le build local)", True),
 )
 
 
@@ -73,25 +73,29 @@ def install_root() -> Path:
 def check_release_binaries(args: argparse.Namespace) -> list[dict[str, Any]]:
     roots = {"repo": REPO_ROOT, "install": install_root()}
     results: list[dict[str, Any]] = []
-    for kind, relative, label in BINARY_CHECKS:
+    for kind, relative, label, gate_required in BINARY_CHECKS:
         path = roots[kind] / relative
+        gate = "daemon" if gate_required else "cli"
         if args.dry_run:
-            results.append({"path": str(path), "label": label, "present": None,
-                            "up_to_date": None})
+            results.append({"path": str(path), "label": label, "gate": gate,
+                            "present": None, "up_to_date": None})
             continue
         if not path.is_file():
-            results.append({"path": str(path), "label": label, "present": False,
-                            "up_to_date": None})
+            results.append({"path": str(path), "label": label, "gate": gate,
+                            "present": False, "up_to_date": None})
             continue
         blob = path.read_bytes()
+        format_gate = FORMAT_GATE_SIGNATURE in blob
+        load_gate = LOAD_GATE_SIGNATURE in blob
         results.append({
             "path": str(path),
             "label": label,
+            "gate": gate,
             "present": True,
             "size_bytes": path.stat().st_size,
-            "up_to_date": (FORMAT_GATE_SIGNATURE in blob and LOAD_GATE_SIGNATURE in blob),
-            "format_gate_qt3": FORMAT_GATE_SIGNATURE in blob,
-            "load_gate_qt3": LOAD_GATE_SIGNATURE in blob,
+            "up_to_date": (format_gate and load_gate) if gate_required else None,
+            "format_gate_qt3": format_gate,
+            "load_gate_qt3": load_gate,
         })
     return results
 
@@ -342,6 +346,9 @@ def build_report(context: dict[str, Any]) -> str:
                          "l'installation ou suppression du fichier)")
         elif binary.get("up_to_date"):
             lines.append(f"- binaire {binary['label']} : {binary['path']} — porte qt3 presente")
+        elif binary.get("gate") == "cli" and binary.get("present"):
+            lines.append(f"- binaire {binary['label']} : {binary['path']} — "
+                         "present (porte qt3 n/a : la porte de chargement vit dans le daemon)")
         else:
             lines.append(f"- binaire {binary['label']} : {binary['path']} — "
                          f"{'absent' if binary.get('present') is False else 'non verifie (dry-run)'}")
@@ -420,6 +427,9 @@ def print_paste_block(context: dict[str, Any]) -> None:
             print(f"binaire : {binary['path']} [{binary['label']}] PERIME (porte qt3 absente)")
         elif binary.get("up_to_date"):
             print(f"binaire : {binary['path']} [{binary['label']}] (porte qt3 presente)")
+        elif binary.get("gate") == "cli" and binary.get("present"):
+            print(f"binaire : {binary['path']} [{binary['label']}] present "
+                  "(porte qt3 dans le daemon)")
     if stale:
         print("remedes : cargo build --release ; mise a jour/suppression des binaires "
               "installes (~/.hipfire/bin) ; hipfire stop si un service resident tourne")
