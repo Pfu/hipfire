@@ -3612,6 +3612,7 @@ const Q8_0_QT: u8 = 3;
 /// Group layout of a dense-TP-admissible projection weight format: MQ4
 /// keeps its 256-wide groups (136 B each), Q8_0 joins on its native
 /// 32-wide groups (34 B each).
+#[derive(Clone, Copy)]
 struct DenseProjFormat {
     group: usize,
     group_bytes: usize,
@@ -3629,11 +3630,6 @@ fn dense_proj_format(qt: u8) -> Option<DenseProjFormat> {
         }),
         _ => None,
     }
-}
-
-#[inline]
-fn is_dense_proj_qt(qt: u8) -> bool {
-    dense_proj_format(qt).is_some()
 }
 
 fn dense_tp_format_refusal(name: &str, qt: u8) -> String {
@@ -4398,6 +4394,33 @@ pub fn preflight_weights_dense_tp(
     Ok(())
 }
 
+fn dense_tp_slice_bytes(
+    data: &[u8],
+    fmt: DenseProjFormat,
+    m: usize,
+    k: usize,
+    slice: DenseTpSlice<'_>,
+) -> Result<(Vec<u8>, usize, usize), String> {
+    use hipfire_runtime::tp_shard::{slice_uniform_group_cols, slice_uniform_rows};
+    match slice {
+        DenseTpSlice::Rows(start, end) => {
+            Ok((slice_uniform_rows(data, m, start, end)?, end - start, k))
+        }
+        DenseTpSlice::RowsMulti(ranges) => {
+            let mut out = Vec::new();
+            for &(start, end) in ranges {
+                out.extend_from_slice(&slice_uniform_rows(data, m, start, end)?);
+            }
+            Ok((out, ranges.iter().map(|(a, b)| b - a).sum(), k))
+        }
+        DenseTpSlice::Cols(start, end) => Ok((
+            slice_uniform_group_cols(data, m, k, start, end, fmt.group)?,
+            m,
+            end - start,
+        )),
+    }
+}
+
 fn load_weight_tensor_dense_tp(
     hfq: &HfqFile,
     gpu: &mut Gpu,
@@ -4406,48 +4429,27 @@ fn load_weight_tensor_dense_tp(
     k: usize,
     slice: DenseTpSlice<'_>,
 ) -> HipResult<WeightTensor> {
-    use hipfire_runtime::tp_shard::{slice_uniform_group_cols, slice_uniform_rows};
-
     // Single metadata lookup for candidate/quant_type; exactly one pread for data below.
     let (info, candidate) = find_qwen35_tensor(hfq, name)
         .ok_or_else(|| HipError::new(0, &format!("TP tensor not found: {name}")))?;
     let quant_type = info.quant_type;
     let candidate = candidate.clone();
-    if !is_dense_proj_qt(quant_type) {
-        return Err(HipError::new(
-            0,
-            &format!(
-                "dense TP2 requires MQ4-G256 qt13, MQ4V2 qt44 or Q8_0 qt3, {candidate} has qt={quant_type}"
-            ),
-        ));
-    }
+    let fmt = match dense_proj_format(quant_type) {
+        Some(fmt) => fmt,
+        None => {
+            return Err(HipError::new(
+                0,
+                &format!(
+                    "dense TP2 requires MQ4-G256 qt13, MQ4V2 qt44 or Q8_0 qt3, {candidate} has qt={quant_type}"
+                ),
+            ))
+        }
+    };
     let (bytes, new_m, new_k) = {
         let (_, data) = hfq
             .tensor_data_pread(&candidate)
             .ok_or_else(|| HipError::new(0, "TP tensor disappeared during load"))?;
-        match slice {
-            DenseTpSlice::Rows(start, end) => (
-                slice_uniform_rows(&data, m, start, end).map_err(|e| HipError::new(0, &e))?,
-                end - start,
-                k,
-            ),
-            DenseTpSlice::RowsMulti(ranges) => {
-                let mut out = Vec::new();
-                for &(start, end) in ranges {
-                    out.extend_from_slice(
-                        &slice_uniform_rows(&data, m, start, end)
-                            .map_err(|e| HipError::new(0, &e))?,
-                    );
-                }
-                (out, ranges.iter().map(|(a, b)| b - a).sum(), k)
-            }
-            DenseTpSlice::Cols(start, end) => (
-                slice_uniform_group_cols(&data, m, k, start, end, 256)
-                    .map_err(|e| HipError::new(0, &e))?,
-                m,
-                end - start,
-            ),
-        }
+        dense_tp_slice_bytes(&data, fmt, m, k, slice).map_err(|e| HipError::new(0, &e))?
     };
     let mut weight =
         match load_weight_tensor_raw(gpu, quant_type, &bytes, new_m, new_k, MemoryTarget::Device) {
@@ -10042,7 +10044,7 @@ mod dense_tp_preflight_format_tests {
     const ARCH_ID: u32 = 5;
     const TP: usize = 2;
 
-    const DIM: usize = 256;
+    pub(super) const DIM: usize = 256;
     const HIDDEN: usize = 512;
     const N_HEADS: usize = 8;
     const HEAD_DIM: usize = 64;
@@ -10055,17 +10057,17 @@ mod dense_tp_preflight_format_tests {
     const CONV: usize = 4;
     const KEY_DIM: usize = KEY_HEADS * KEY_HEAD_DIM;
     const VALUE_DIM: usize = VALUE_HEADS * VALUE_HEAD_DIM;
-    const QKV_DIM: usize = 2 * KEY_DIM + VALUE_DIM;
+    pub(super) const QKV_DIM: usize = 2 * KEY_DIM + VALUE_DIM;
     const KV_DIM: usize = N_KV * HEAD_DIM;
     const Q_ROWS: usize = N_HEADS * HEAD_DIM * 2;
-    const O_IN: usize = N_HEADS * HEAD_DIM;
+    pub(super) const O_IN: usize = N_HEADS * HEAD_DIM;
 
-    struct FixtureFile {
+    pub(super) struct FixtureFile {
         path: std::path::PathBuf,
     }
 
     impl FixtureFile {
-        fn write(label: &str, metadata_json: &str, tensors: &[HfqMemTensor]) -> Self {
+        pub(super) fn write(label: &str, metadata_json: &str, tensors: &[HfqMemTensor]) -> Self {
             let path = std::env::temp_dir().join(format!(
                 "hipfire-q35-preflight-{label}-{}.hfq",
                 std::process::id()
@@ -10075,7 +10077,7 @@ mod dense_tp_preflight_format_tests {
             FixtureFile { path }
         }
 
-        fn open(&self) -> HfqFile {
+        pub(super) fn open(&self) -> HfqFile {
             HfqFile::open(&self.path).expect("open HFQ fixture")
         }
     }
@@ -10086,7 +10088,7 @@ mod dense_tp_preflight_format_tests {
         }
     }
 
-    fn fixture_metadata(dim: usize) -> String {
+    pub(super) fn fixture_metadata(dim: usize) -> String {
         serde_json::json!({
             "architecture": "qwen35",
             "config": {
@@ -10116,7 +10118,7 @@ mod dense_tp_preflight_format_tests {
         .to_string()
     }
 
-    fn tensor(name: &str, shape: Vec<u32>, qt: u8, group: u32, data: Vec<u8>) -> HfqMemTensor {
+    pub(super) fn tensor(name: &str, shape: Vec<u32>, qt: u8, group: u32, data: Vec<u8>) -> HfqMemTensor {
         HfqMemTensor {
             name: name.to_string(),
             quant_type: qt,
@@ -10463,5 +10465,323 @@ mod dense_tp_preflight_format_tests {
         );
         assert_eq!(expected_grouped_bytes(m, 48, 32, 34), None);
         assert_eq!(expected_grouped_bytes(m, 48, 256, 136), None);
+    }
+}
+
+#[cfg(test)]
+mod dense_tp_slice_group_tests {
+    use super::*;
+    use super::dense_tp_preflight_format_tests::{fixture_metadata, tensor};
+    use super::dense_tp_preflight_format_tests::{DIM, FixtureFile, O_IN, QKV_DIM};
+    use crate::qwen35::config::{dense_tp_rank_layouts, DenseTpRankLayout};
+    use crate::qwen35::config_from_hfq;
+    use hipfire_runtime::tp_shard::slice_uniform_group_cols;
+
+    fn dense_fmt(qt: u8) -> DenseProjFormat {
+        dense_proj_format(qt).expect("admitted dense TP format")
+    }
+
+    fn group_blob(rows: usize, group_bytes: usize, groups_per_row: usize) -> Vec<u8> {
+        let row_bytes = groups_per_row * group_bytes;
+        (0..rows * row_bytes)
+            .map(|i| {
+                let row = i / row_bytes;
+                let group = (i % row_bytes) / group_bytes;
+                ((row * groups_per_row + group) % 256) as u8
+            })
+            .collect()
+    }
+
+    fn expected_group_markers(
+        rows: usize,
+        group_bytes: usize,
+        groups_per_row: usize,
+        first_group: usize,
+        groups: usize,
+    ) -> Vec<u8> {
+        let mut out = Vec::with_capacity(rows * groups * group_bytes);
+        for row in 0..rows {
+            for group in first_group..first_group + groups {
+                out.extend(
+                    std::iter::repeat(((row * groups_per_row + group) % 256) as u8)
+                        .take(group_bytes),
+                );
+            }
+        }
+        out
+    }
+
+    fn fixture_tensor_blob(
+        label: &str,
+        name: &str,
+        shape: [usize; 2],
+        qt: u8,
+        group: u32,
+        data: Vec<u8>,
+    ) -> Vec<u8> {
+        let fixture = FixtureFile::write(
+            label,
+            &fixture_metadata(DIM),
+            &[tensor(
+                name,
+                vec![shape[0] as u32, shape[1] as u32],
+                qt,
+                group,
+                data,
+            )],
+        );
+        let hfq = fixture.open();
+        let (_, read) = hfq.tensor_data_pread(name).expect("fixture tensor data");
+        read.to_vec()
+    }
+
+    #[test]
+    fn qt3_cols_slice_per_rank_follows_group_32() {
+        let (m, k) = (DIM, O_IN);
+        let data = fixture_tensor_blob(
+            "qt3-cols-g32",
+            "layers.1.self_attn.o_proj.weight",
+            [m, k],
+            Q8_0_QT,
+            32,
+            group_blob(m, 34, k / 32),
+        );
+        let fmt = dense_fmt(Q8_0_QT);
+        let rank0 = dense_tp_slice_bytes(&data, fmt, m, k, DenseTpSlice::Cols(0, 256))
+            .expect("rank 0 qt3 column slice");
+        assert_eq!(rank0, (expected_group_markers(m, 34, k / 32, 0, 8), m, 256));
+        let rank1 = dense_tp_slice_bytes(&data, fmt, m, k, DenseTpSlice::Cols(256, k))
+            .expect("rank 1 qt3 column slice");
+        assert_eq!(rank1, (expected_group_markers(m, 34, k / 32, 8, 8), m, 256));
+        let legacy0 = slice_uniform_group_cols(&data, m, k, 0, 256, 256)
+            .expect("legacy group-256 slice rank 0");
+        assert_eq!(rank0.0, legacy0);
+        let legacy1 = slice_uniform_group_cols(&data, m, k, 256, k, 256)
+            .expect("legacy group-256 slice rank 1");
+        assert_eq!(rank1.0, legacy1);
+    }
+
+    #[test]
+    fn qt3_cols_slice_accepts_widths_outside_g256() {
+        let (m, k) = (8, 96);
+        let data = fixture_tensor_blob(
+            "qt3-cols-k96",
+            "probe.weight",
+            [m, k],
+            Q8_0_QT,
+            32,
+            group_blob(m, 34, k / 32),
+        );
+        let fmt = dense_fmt(Q8_0_QT);
+        let rank0 = dense_tp_slice_bytes(&data, fmt, m, k, DenseTpSlice::Cols(0, 64))
+            .expect("qt3 column slice inside a G32-only width");
+        assert_eq!(rank0, (expected_group_markers(m, 34, k / 32, 0, 2), m, 64));
+        let rank1 = dense_tp_slice_bytes(&data, fmt, m, k, DenseTpSlice::Cols(64, k))
+            .expect("qt3 column slice tail");
+        assert_eq!(rank1, (expected_group_markers(m, 34, k / 32, 2, 1), m, 32));
+    }
+
+    #[test]
+    fn qt13_qt44_cols_slice_still_uses_group_256() {
+        let (m, k) = (DIM, O_IN);
+        for qt in [MQ4_G256_QT, MQ4V2_G256_QT] {
+            let data = fixture_tensor_blob(
+                "mq-cols-g256",
+                "layers.1.self_attn.o_proj.weight",
+                [m, k],
+                qt,
+                256,
+                group_blob(m, 136, k / 256),
+            );
+            let fmt = dense_fmt(qt);
+            let rank0 = dense_tp_slice_bytes(&data, fmt, m, k, DenseTpSlice::Cols(0, 256))
+                .expect("MQ4 rank 0 column slice");
+            assert_eq!(rank0, (expected_group_markers(m, 136, k / 256, 0, 1), m, 256));
+            let rank1 = dense_tp_slice_bytes(&data, fmt, m, k, DenseTpSlice::Cols(256, k))
+                .expect("MQ4 rank 1 column slice");
+            assert_eq!(rank1, (expected_group_markers(m, 136, k / 256, 1, 1), m, 256));
+            let legacy0 = slice_uniform_group_cols(&data, m, k, 0, 256, 256)
+                .expect("legacy group-256 slice rank 0");
+            assert_eq!(rank0.0, legacy0);
+        }
+    }
+
+    #[test]
+    fn rows_slices_unchanged_across_formats() {
+        let (m, k) = (QKV_DIM, DIM);
+        let cases = [
+            (Q8_0_QT, 32u32, 34usize, k / 32),
+            (MQ4_G256_QT, 256, 136, k / 256),
+        ];
+        for (qt, group, group_bytes, groups_per_row) in cases {
+            let row_bytes = groups_per_row * group_bytes;
+            let data = fixture_tensor_blob(
+                "tp-rows-slice",
+                "layers.0.linear_attn.in_proj_qkv.weight",
+                [m, k],
+                qt,
+                group,
+                group_blob(m, group_bytes, groups_per_row),
+            );
+            let fmt = dense_fmt(qt);
+            let rows13 = dense_tp_slice_bytes(&data, fmt, m, k, DenseTpSlice::Rows(1, 3))
+                .expect("row slice");
+            assert_eq!(rows13, (data[row_bytes..3 * row_bytes].to_vec(), 2, k));
+            let multi = dense_tp_slice_bytes(
+                &data,
+                fmt,
+                m,
+                k,
+                DenseTpSlice::RowsMulti(&[(0, 1), (6, 8)]),
+            )
+            .expect("rows multi slice");
+            let mut expected = Vec::new();
+            expected.extend_from_slice(&data[..row_bytes]);
+            expected.extend_from_slice(&data[6 * row_bytes..8 * row_bytes]);
+            assert_eq!(multi, (expected, 3, k));
+        }
+    }
+
+    #[test]
+    fn cols_slice_refuses_ranges_outside_the_format_group() {
+        let (m, k) = (8, 96);
+        let data = fixture_tensor_blob(
+            "qt3-slice-refuse",
+            "probe.weight",
+            [m, k],
+            Q8_0_QT,
+            32,
+            group_blob(m, 34, k / 32),
+        );
+        let fmt = dense_fmt(Q8_0_QT);
+        assert_eq!(
+            dense_tp_slice_bytes(&data, fmt, m, k, DenseTpSlice::Cols(0, 48))
+                .expect_err("misaligned column end must be refused"),
+            "invalid uniform-group column slice 0..48 for 8x96, group=32, bytes=816"
+        );
+        assert_eq!(
+            dense_tp_slice_bytes(&data, fmt, m, 50, DenseTpSlice::Cols(0, 32))
+                .expect_err("width not a multiple of the group must be refused"),
+            "invalid uniform-group column slice 0..32 for 8x50, group=32, bytes=816"
+        );
+        let (m512, k512) = (8, 512);
+        let truncated = group_blob(m512, 34, k512 / 32)[..4332].to_vec();
+        assert_eq!(
+            dense_tp_slice_bytes(&truncated, fmt, m512, k512, DenseTpSlice::Cols(0, 256))
+                .expect_err("truncated blob must be refused"),
+            "invalid uniform-group column slice 0..256 for 8x512, group=32, bytes=4332"
+        );
+        let short_rows = group_blob(7, 34, k512 / 32);
+        assert_eq!(
+            dense_tp_slice_bytes(&short_rows, fmt, m512, k512, DenseTpSlice::Cols(0, 256))
+                .expect_err("blob row count mismatch must be refused"),
+            "row bytes 476 are not divisible by 16 quant groups"
+        );
+        let (mm, kk) = (4, 512);
+        let mq4 = group_blob(mm, 136, kk / 256);
+        assert_eq!(
+            dense_tp_slice_bytes(&mq4, dense_fmt(MQ4_G256_QT), mm, kk, DenseTpSlice::Cols(0, 128))
+                .expect_err("misaligned MQ4 column end must be refused"),
+            "invalid uniform-group column slice 0..128 for 4x512, group=256, bytes=1088"
+        );
+    }
+
+    fn layout_probe_metadata() -> String {
+        serde_json::json!({
+            "architecture": "qwen35",
+            "config": {
+                "hidden_size": 1024,
+                "num_hidden_layers": 2,
+                "num_attention_heads": 8,
+                "num_key_value_heads": 2,
+                "head_dim": 128,
+                "vocab_size": 128,
+                "intermediate_size": 1024,
+                "rms_norm_eps": 1e-5,
+                "rope_parameters": {
+                    "rope_theta": 5000000.0,
+                    "mrope_interleaved": true,
+                    "mrope_section": [12, 13, 14]
+                },
+                "partial_rotary_factor": 0.5,
+                "linear_num_key_heads": 8,
+                "linear_num_value_heads": 8,
+                "linear_key_head_dim": 128,
+                "linear_value_head_dim": 128,
+                "linear_conv_kernel_dim": 4,
+                "layer_types": ["linear_attention", "full_attention"],
+                "norm_topk_prob": false
+            }
+        })
+        .to_string()
+    }
+
+    fn assert_cols_aligned_per_format(
+        config: &Qwen35Config,
+        layouts: &[DenseTpRankLayout],
+        qt: u8,
+    ) {
+        let fmt = dense_fmt(qt);
+        for layout in layouts {
+            let cols_ranges = [
+                (
+                    layout.q_head_range.start * config.head_dim,
+                    layout.q_head_range.end * config.head_dim,
+                ),
+                (
+                    layout.delta_value_head_range.start * config.linear_value_head_dim,
+                    layout.delta_value_head_range.end * config.linear_value_head_dim,
+                ),
+                (layout.ffn_hidden_range.start, layout.ffn_hidden_range.end),
+            ];
+            for (start, end) in cols_ranges {
+                assert_eq!(
+                    start % fmt.group, 0,
+                    "qt={qt} rank {} column start {start} is not G{} aligned",
+                    layout.rank, fmt.group
+                );
+                assert_eq!(
+                    end % fmt.group, 0,
+                    "qt={qt} rank {} column end {end} is not G{} aligned",
+                    layout.rank, fmt.group
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn dense_tp_layouts_align_local_cols_per_format_group() {
+        let fixture = FixtureFile::write(
+            "slice-layout-fixture",
+            &fixture_metadata(DIM),
+            &[tensor(
+                "norm.weight",
+                vec![DIM as u32],
+                2,
+                0,
+                vec![0u8; DIM * 4],
+            )],
+        );
+        let hfq = fixture.open();
+        let config = config_from_hfq(&hfq).expect("fixture config parses");
+        let shard2 = ShardConfig::new(2, false, 0, ExpertAssign::Stride).expect("tp2 shard");
+        let layouts = dense_tp_rank_layouts(&config, &shard2).expect("fixture geometry admits tp2");
+        for qt in [MQ4_G256_QT, MQ4V2_G256_QT, Q8_0_QT] {
+            assert_cols_aligned_per_format(&config, &layouts, qt);
+        }
+        let shard3 = ShardConfig::new(3, false, 0, ExpertAssign::Stride).expect("tp3 shard");
+        assert!(dense_tp_rank_layouts(&config, &shard3).is_err());
+
+        let probe = FixtureFile::write("slice-layout-probe", &layout_probe_metadata(), &[]);
+        let probe_hfq = probe.open();
+        let probe_config = config_from_hfq(&probe_hfq).expect("probe config parses");
+        for tp in 2..=4 {
+            let shard = ShardConfig::new(tp, false, 0, ExpertAssign::Stride).expect("probe shard");
+            let layouts =
+                dense_tp_rank_layouts(&probe_config, &shard).expect("probe geometry admits tp");
+            for qt in [MQ4_G256_QT, MQ4V2_G256_QT, Q8_0_QT] {
+                assert_cols_aligned_per_format(&probe_config, &layouts, qt);
+            }
+        }
     }
 }
