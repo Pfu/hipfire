@@ -1,6 +1,6 @@
 # Qwen3.5 (arch 5) — 2 GPU + tool_call + MTP en Q8 : plan d'implementation ordonne
 
-**Status:** actif — phases 0 et 2 closes sur materiel (journal et compte rendu plus bas) ; phase 3 (preflight qt3) livree (code + tests CPU, a compiler et a valider sur GPU) ; phase 1 (spike) ouverte.
+**Status:** actif — phases 0 et 2 closes sur materiel (journal et compte rendu plus bas) ; phase 3 (preflight qt3) : tests CPU verts sur materiel (run 20261027T080657Z), reste la validation GPU de la porte de format q8 ; phase 1 (spike) ouverte.
 **Auteur:** (agent)
 **Cree:** 2026-10-27
 **Specification:** `docs/plans/2026-10-27-qwen35-2gpu-q8-tools-mtp-spec.md` (absente du depot
@@ -262,6 +262,16 @@ admission fail-closed ; validation token-exacte PP-MTP vs mono-carte MTP.
   - Reste a valider : `cargo test -p hipfire-arch-qwen35` (cote utilisateur), puis sur GPU que
     le q8 passe la porte de format (peut encore echouer plus loin — slicing phase 4, admission
     kernels phase 5).
+  - **2026-10-27 — Tests CPU verts sur materiel** (run `results/run-20261027T080657Z`,
+    commit `11a83236e`, rustc/cargo 1.101.0-nightly) : compilation OK ; lib 432 passed /
+    0 failed / 25 ignored (les 25 = fault-seams GPU et suites `#[ignore]` attendues) ;
+    mod `dense_tp_preflight_format_tests` 12/12 ok ; suites d'integration `tests/*.rs`
+    ok (elles n'avaient pas tourne au run precedent : cargo s'arrete au premier echec) ;
+    skips runtime 0 (tous les tests GPU du crate sont `#[ignore]` ou passent). Deux
+    correctifs de fixtures ont ete necessaires (norme finale `norm.weight` omise ;
+    suffixe ` (hipError=0)` du message HipError dans l'attente qt53). Porte de sortie CPU
+    de la phase atteinte ; reste la validation GPU : `run` du trunk q8 en tp2 doit
+    depasser le message de format observe en phase 2.
   - Protocole automatise : `scripts/phase3_preflight_tests.py` pilote la compilation
     (`cargo test -p hipfire-arch-qwen35 --no-run`) puis l'execution des tests (avec
     `--show-output` pour rendre les skips runtime comptables), sous le verrou GPU du plan,
