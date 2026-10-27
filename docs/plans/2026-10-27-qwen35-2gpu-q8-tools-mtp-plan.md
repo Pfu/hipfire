@@ -253,6 +253,15 @@ admission fail-closed ; validation token-exacte PP-MTP vs mono-carte MTP.
 - **Artefacts de phase 0 identifies** (dans `registry/v1.json`, arch 5) : trunk q8 local
   `qwen3.8-27b.q8.hfq` ; reference mq4 du registre `qwen3.8:27b` -> `qwen3.8-27b.mq4` avec tete
   MTP sidecar `qwen3.8-27b.mtp`. A telecharger et sceller (sha256) a l'execution de la phase 0.
+- **2026-10-27 — Phase 0, premier passage sur mq4-xts** : scellement ok (trunk q8, mq4-xts,
+  tete MTP ; aucun telechargement) ; `bench mq4 tp2` x3 ok (baseline tp2 mesuree, JSON bruts
+  conserves) ; `run mq4 tp2 --spec mtp` ok (attache MTP operationnelle en tp2). Refus de cadrage
+  observes (le draft DFlash declare pour les tiers qwen3.8:27b est resolu automatiquement) :
+  `run tp2` sans spec -> `EP serving (tp>1) does not support DFlash drafters in v1; reload
+  without a draft.` ; `bench pp2` -> `DFlash speculative decode requires pp=1 in v1 (...)` ;
+  `HIPFIRE_PP_DFLASH=1` reste ecarte (precedent du plan : charge accepte, generation sans
+  spec-decode cross-card). Le script epingle donc `--spec off` (runs/benchs de mesure) et
+  `--spec mtp` (run d'attache MTP) ; `--bench-spec` choisit le mode des benchs.
 - **Protocole automatise** : `scripts/phase0_reference.py` pilote toute la phase (scellement
   sha256, peer access mq4 tp2, attache MTP, 3 processus frais de bench mq4 tp2 et pp2 via
   `HIPFIRE_TOPOLOGY_PP=2`, fit machine) sous le verrou GPU du plan, et produit

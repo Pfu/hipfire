@@ -80,6 +80,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tg", type=int, default=128, help="tokens de decode par run bench (defaut 128)")
     parser.add_argument("--max-seq", type=int, default=4096, help="contexte des runs de peer access")
     parser.add_argument("--prompt", default="Hello", help="prompt des runs de peer access")
+    parser.add_argument("--bench-spec", default="off",
+                        help="mode de speculation des benchs (defaut off = AR pur, "
+                             "passez mtp pour la voie outils+MTP) ; les runs de peer access "
+                             "utilisent --spec off et le run MTP --spec mtp")
     parser.add_argument("--timeout", type=int, default=3600, help="timeout par commande en secondes")
     parser.add_argument("--pull", action="store_true",
                         help="autoriser `hipfire pull` si l'artefact mq4 vise est absent "
@@ -210,6 +214,9 @@ def parse_bench_report(report: dict[str, Any]) -> dict[str, Any]:
         "prefill_samples": samples.get("prefill") or [],
         "prompt_tokens": report.get("prompt_tokens"),
         "max_seq": report.get("max_seq"),
+        "spec_requested": report.get("spec_requested"),
+        "spec_route": (report.get("spec_route") or [None])[0]
+        if isinstance(report.get("spec_route"), list) else report.get("spec_route"),
         "topology": find_topology(report),
         "warnings": report.get("warnings") or [],
     }
@@ -327,7 +334,8 @@ def build_report(context: dict[str, Any]) -> str:
             decode_text = f"decode mean {decode['mean']}" if decode else "decode n/a"
             prefill_text = f"prefill mean {prefill['mean']}" if prefill else "prefill n/a"
             lines.append(f"- processus {index} : {decode_text} tok/s ; {prefill_text} tok/s ; "
-                         f"topology {run.get('topology')}")
+                         f"topology {run.get('topology')} ; spec {run.get('spec_requested')}"
+                         f" / route {run.get('spec_route')}")
             for warning in run.get("warnings") or []:
                 lines.append(f"  - warning : {warning}")
         lines.append(f"- pool decode : {data['pool_decode']}")
@@ -445,9 +453,11 @@ def main() -> int:
             print(f"[{status}] {name}: {artifact['path']}")
 
     model_arg = str(mq4_path) if mq4_path else str(models_dir() / f"<fichier de {args.mq4_tag}>")
-    run_cmd = [str(hipfire), "run", model_arg, "--tp", "2", "--max-seq", str(args.max_seq),
-               "--temp", "0", args.prompt]
-    peer_run = run_step(args, "run-mq4-tp2", run_cmd, logs_dir / "run-mq4-tp2.log")
+    def run_command_for(spec: str) -> list[str]:
+        return [str(hipfire), "run", model_arg, "--tp", "2", "--max-seq", str(args.max_seq),
+                "--temp", "0", "--spec", spec, args.prompt]
+
+    peer_run = run_step(args, "run-mq4-tp2", run_command_for("off"), logs_dir / "run-mq4-tp2.log")
     steps.append(peer_run)
     peer_text = full_log(peer_run.log_path)
     peer_access = extract_peer_access(peer_text)
@@ -455,10 +465,8 @@ def main() -> int:
     if peer_access is not None:
         peer_access["source"] = peer_source
 
-    mtp_cmd = run_cmd.copy()
-    mtp_index = mtp_cmd.index("--tp")
-    mtp_cmd[mtp_index:mtp_index] = ["--spec", "mtp"]
-    mtp_run = run_step(args, "run-mq4-tp2-mtp", mtp_cmd, logs_dir / "run-mq4-tp2-mtp.log")
+    mtp_run = run_step(args, "run-mq4-tp2-mtp", run_command_for("mtp"),
+                       logs_dir / "run-mq4-tp2-mtp.log")
     steps.append(mtp_run)
     mtp_text = full_log(mtp_run.log_path)
     if peer_access is None:
@@ -473,7 +481,8 @@ def main() -> int:
         for index in range(1, args.processes + 1):
             bench_path = benches_dir / f"p0-mq4-{config}-{index}.json"
             bench_log = logs_dir / f"bench-mq4-{config}-{index}.log"
-            bench_cmd = [str(hipfire), "bench", model_arg, "--tg", str(args.tg), "-j"]
+            bench_cmd = [str(hipfire), "bench", model_arg, "--spec", args.bench_spec,
+                         "--tg", str(args.tg), "-j"]
             step = run_step(args, f"bench-mq4-{config}-{index}", bench_cmd, bench_log,
                             env_extra=env_extra)
             steps.append(step)
