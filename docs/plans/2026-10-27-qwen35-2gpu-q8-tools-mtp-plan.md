@@ -1,6 +1,6 @@
 # Qwen3.5 (arch 5) — 2 GPU + tool_call + MTP en Q8 : plan d'implementation ordonne
 
-**Status:** actif — phases 0, 2 et 3 closes sur materiel (journal et compte rendu plus bas) ; phase 3 : tests CPU verts (run 20261027T080657Z) et porte qt3 passee sur GPU avec decode complet (trunk q8 tp2, 54 tok @ 43.8 tok/s) ; phases 4-5 re-calibrees par le run (slicing et admission kernels deja fonctionnels sur l'artefact cible G256) ; phase 1 (spike) ouverte.
+**Status:** actif — phases 0, 2 et 3 closes sur materiel (journal et compte rendu plus bas) ; phase 4 livree (slicing par groupe de format + tests CPU ; validation materielle en attente) ; phases 4-5 re-calibrees par le run de cloture de la phase 3 (slicing et admission kernels deja fonctionnels sur l'artefact cible G256 ; restent le prefill long >= 256 tokens et la parite tp2-vs-mono) ; phase 1 (spike) ouverte.
 **Auteur:** (agent)
 **Cree:** 2026-10-27
 **Specification:** `docs/plans/2026-10-27-qwen35-2gpu-q8-tools-mtp-spec.md` (absente du depot
@@ -234,6 +234,41 @@ admission fail-closed ; validation token-exacte PP-MTP vs mono-carte MTP.
 ---
 
 ## Journal d'execution
+
+- **2026-10-27 — Phase 4 livree (slicing par groupe de format ; validation CPU/GPU en attente)** :
+  - `dense_tp_slice_bytes` (nouveau, pur, `crates/hipfire-arch-qwen35/src/qwen35/load.rs`) :
+    extraction de la selection de tranche de `load_weight_tensor_dense_tp` — `Rows`/`RowsMulti`
+    inchanges au caractere pres, `Cols` decoupe avec le groupe du format (`DenseProjFormat.group` :
+    256 pour qt13/qt44, 32 pour qt3) au lieu du 256 en dur ; `load_weight_tensor_raw` reste le seul
+    point d'upload (qt3 => `DType::Q8_0`). La porte de format reste la premiere verification
+    (`dense TP2 requires MQ4-G256 qt13, MQ4V2 qt44 or Q8_0 qt3` verbatim) ; `is_dense_proj_qt`
+    supprime (absorbe par le match sur `dense_proj_format`, source de verite unique). Fail-closed
+    inchange : une tranche non alignee au groupe du format est refusee par
+    `slice_uniform_group_cols` (message runtime verbatim), aucun fallback silencieux.
+  - Equivalence legacy conservee : pour `k % 256 == 0`, la decoupe G32 selectionne exactement les
+    memes octets que l'ancienne G256 en dur (272 o/ligne/rang sur k=512) — pinnee par test
+    (comparaison directe avec `slice_uniform_group_cols(..., 256)`). Nouvelle capacite : les
+    largeurs qt3 « G32 seulement » (ex. k=96) sont desormais sliceables ; hors de ces largeurs,
+    refus explicite (meme message runtime que la phase 3).
+  - Tests CPU (`mod dense_tp_slice_group_tests`, fixtures HFQ via `write_hfqm_package_mem`, style
+    du mod phase 3 dont il reutilise les helpers publies `pub(super)`) : qt3 `o_proj` [256x512]
+    slice par rang a G32 (octets exacts par rang + equivalence legacy), qt3 k=96 hors G256,
+    qt13/qt44 inchanges a G256, `Rows`/`RowsMulti` inchanges sur les deux familles, refus
+    fail-closed verbatim (fin non G32, k non multiple de 32, blob tronque, row_bytes non divisibles
+    par les groupes, fin non G256 qt13), invariant « largeurs locales alignees » des layouts
+    (`dense_tp_rank_layouts`) verifie par format (256 et 32) pour les trois formats admis : borne
+    start/end des ranges `Cols` du loader (q x head_dim, dv x value_dim, ffn) sur la geometrie
+    fixture (tp2) et une geometrie sonde tp2..4 (chemin GQA splitté) ; tp3 sur la geometrie
+    fixture refuse (2 macro-unites Delta < 3).
+  - Script `scripts/phase4_slice_arithmetic.py` : re-implementation autonome de l'arithmetique de
+    slicing (batterie integree, `--k`, `--hfq` pour auditer un artefact reel depuis header+index :
+    taille de blob vs (m, k, groupe), champ group_size, classification G256-exact / G32-only,
+    decoupe tp par groupes entiers pour o_proj/down_proj/out_proj). Cote prod :
+    `python3 scripts/phase4_slice_arithmetic.py --hfq ~/qwen3.8-27b.q8.hfq`.
+  - Reste a valider : `cargo test -p hipfire-arch-qwen35` (cote utilisateur), puis GPU : le run tp2
+    du trunk q8 doit rester identique (artefact tout-G256 : slicing G32 equivalent a G256, verifie
+    par test et par le script) ; prefill long (>= 256 tokens, chunks WMMA reels) et parite
+    tp2-vs-mono restent l'objet des phases 5 et 7.
 
 - **2026-10-27 — Phase 3 livree (code + tests CPU ; validation CPU/GPU en attente)** :
   - `validate_mq4_proj_info` -> `validate_dense_proj_info` (`crates/hipfire-arch-qwen35/src/qwen35/load.rs`) :
