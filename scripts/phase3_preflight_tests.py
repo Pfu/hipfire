@@ -47,28 +47,57 @@ from typing import Any
 REPO_ROOT = Path(__file__).resolve().parents[1]
 CRATE = "hipfire-arch-qwen35"
 PREFLIGHT_MOD = "dense_tp_preflight_format_tests"
-RELEASE_BINARY = "target/release/hipfire"
-# Signatures du correctif porte-de-format qt3 dans le binaire release : si
-# absentes, le binaire date d'avant le correctif et tout run GPU rejouera le
-# vieux refus ("dense TP requires qt13 or qt44, got qt=3").
+# Signatures du correctif porte-de-format qt3 dans les binaires : si absentes,
+# le binaire date d'avant le correctif et tout run GPU rejouera le vieux refus
+# ("dense TP requires qt13 or qt44, got qt=3").
 FORMAT_GATE_SIGNATURE = b"qt13, qt44 or qt3"
 LOAD_GATE_SIGNATURE = b"MQ4V2 qt44 or Q8_0 qt3"
 
+# Binaires susceptibles d'executer un load : le CLI (lance direct), le daemon
+# du build local, et les binaires installes (le CLI cherche le daemon dans
+# ~/.hipfire/bin/ AVANT target/release — un daemon installe perime prime).
+# "repo" = racine du depot ; "install" = racine d'installation (HIPFIRE_HOME).
+BINARY_CHECKS = (
+    ("repo", "target/release/hipfire", "cli du build local"),
+    ("repo", "target/release/daemon", "daemon du build local"),
+    ("install", "bin/hipfire", "cli installe"),
+    ("install", "bin/daemon", "daemon installe (prioritaire sur le build local)"),
+)
 
-def check_release_binary(args: argparse.Namespace) -> dict[str, Any]:
-    path = REPO_ROOT / RELEASE_BINARY
-    if args.dry_run:
-        return {"path": str(path), "present": None, "up_to_date": None}
-    if not path.is_file():
-        return {"path": str(path), "present": False, "up_to_date": None}
-    blob = path.read_bytes()
-    return {
-        "path": str(path),
-        "present": True,
-        "size_bytes": path.stat().st_size,
-        "format_gate_qt3": FORMAT_GATE_SIGNATURE in blob,
-        "load_gate_qt3": LOAD_GATE_SIGNATURE in blob,
-    }
+
+def install_root() -> Path:
+    home = os.environ.get("HIPFIRE_HOME")
+    return Path(home).expanduser() if home else Path.home() / ".hipfire"
+
+
+def check_release_binaries(args: argparse.Namespace) -> list[dict[str, Any]]:
+    roots = {"repo": REPO_ROOT, "install": install_root()}
+    results: list[dict[str, Any]] = []
+    for kind, relative, label in BINARY_CHECKS:
+        path = roots[kind] / relative
+        if args.dry_run:
+            results.append({"path": str(path), "label": label, "present": None,
+                            "up_to_date": None})
+            continue
+        if not path.is_file():
+            results.append({"path": str(path), "label": label, "present": False,
+                            "up_to_date": None})
+            continue
+        blob = path.read_bytes()
+        results.append({
+            "path": str(path),
+            "label": label,
+            "present": True,
+            "size_bytes": path.stat().st_size,
+            "up_to_date": (FORMAT_GATE_SIGNATURE in blob and LOAD_GATE_SIGNATURE in blob),
+            "format_gate_qt3": FORMAT_GATE_SIGNATURE in blob,
+            "load_gate_qt3": LOAD_GATE_SIGNATURE in blob,
+        })
+    return results
+
+
+def stale_binaries(binaries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [binary for binary in binaries if binary.get("up_to_date") is False]
 
 SUITE_HEADER_RE = re.compile(r"^\s*(Running\s+\S+.*|Doc-tests\s+\S+.*)$", re.MULTILINE)
 TEST_LINE_RE = re.compile(
@@ -306,15 +335,16 @@ def build_report(context: dict[str, Any]) -> str:
              f"— {context['git_subject']}")
     lines.append(f"- rustc : {context['rustc_version']} ; cargo : {context['cargo_version']}")
     lines.append(f"- verrou GPU : {context['flock_note']}")
-    release = context["release_binary"]
-    if release.get("up_to_date") is False:
-        lines.append(f"- binaire release : {release['path']} — PERIME (porte qt3 absente ; "
-                     "reconstruisez avec `cargo build --release` avant tout run GPU)")
-    elif release.get("up_to_date"):
-        lines.append(f"- binaire release : {release['path']} — porte qt3 presente")
-    else:
-        lines.append(f"- binaire release : {release['path']} — "
-                     f"{'absent' if release.get('present') is False else 'non verifie (dry-run)'}")
+    for binary in context["release_binaries"]:
+        if binary.get("up_to_date") is False:
+            lines.append(f"- binaire {binary['label']} : {binary['path']} — PERIME "
+                         "(porte qt3 absente ; cargo build --release, mise a jour de "
+                         "l'installation ou suppression du fichier)")
+        elif binary.get("up_to_date"):
+            lines.append(f"- binaire {binary['label']} : {binary['path']} — porte qt3 presente")
+        else:
+            lines.append(f"- binaire {binary['label']} : {binary['path']} — "
+                         f"{'absent' if binary.get('present') is False else 'non verifie (dry-run)'}")
     compile_step = context["compile"]
     lines.append(f"- compilation des tests : {'OK' if compile_step['ok'] else 'ECHEC'} "
                  f"({compile_step['duration_s']:.1f}s)")
@@ -384,12 +414,15 @@ def print_paste_block(context: dict[str, Any]) -> None:
     print("=" * 24, "RESUME POUR ANALYSE", "=" * 24)
     print(f"git     : {context['git_rev']} ({context['git_branch']}, {context['git_state']})")
     print(f"rustc   : {context['rustc_version']}")
-    release = context["release_binary"]
-    if release.get("up_to_date") is False:
-        print(f"binaire : {release['path']} PERIME (porte qt3 absente) — "
-              f"cargo build --release requis avant tout run GPU")
-    elif release.get("up_to_date"):
-        print(f"binaire : {release['path']} (porte qt3 presente)")
+    stale = stale_binaries(context["release_binaries"])
+    for binary in context["release_binaries"]:
+        if binary.get("up_to_date") is False:
+            print(f"binaire : {binary['path']} [{binary['label']}] PERIME (porte qt3 absente)")
+        elif binary.get("up_to_date"):
+            print(f"binaire : {binary['path']} [{binary['label']}] (porte qt3 presente)")
+    if stale:
+        print("remedes : cargo build --release ; mise a jour/suppression des binaires "
+              "installes (~/.hipfire/bin) ; hipfire stop si un service resident tourne")
     print(f"compile : {'OK' if compile_step['ok'] else 'ECHEC'} "
           f"({compile_step['duration_s']:.1f}s, {compile_step['diagnostics']['warning_count']} warnings)")
     for line in compile_step["diagnostics"]["error_lines"][:5]:
@@ -473,12 +506,15 @@ def main() -> int:
                             if status_text.strip() else "clean")
     context["rustc_version"] = first_line(rustc_text) or "n/a"
     context["cargo_version"] = first_line(cargo_text) or "n/a"
-    context["release_binary"] = check_release_binary(args)
-    release = context["release_binary"]
-    if release.get("up_to_date") is False:
-        print(f"ATTENTION : {release['path']} ne contient pas la porte qt3 "
-              f"(reconstruisez : cargo build --release) ; tout run GPU rejouera "
-              f"le vieux refus de format", file=sys.stderr)
+    context["release_binaries"] = check_release_binaries(args)
+    stale = stale_binaries(context["release_binaries"])
+    if stale:
+        names = ", ".join(binary["path"] for binary in stale)
+        print(f"ATTENTION : binaire(s) perime(s) sans la porte qt3 : {names}", file=sys.stderr)
+        print("  remedes : cargo build --release (workspace complet : cli + daemon), "
+              "mettez a jour ou retirez les binaires installes (~/.hipfire/bin, "
+              "prioritaires sur le build local), et arretez tout service resident "
+              "(hipfire stop) avant le run GPU", file=sys.stderr)
 
     cargo_common = ["cargo", "test", "-p", CRATE]
     if args.release:
