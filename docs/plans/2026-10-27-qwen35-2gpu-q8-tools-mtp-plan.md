@@ -1,6 +1,6 @@
 # Qwen3.5 (arch 5) — 2 GPU + tool_call + MTP en Q8 : plan d'implementation ordonne
 
-**Status:** actif — phases 0 et 2 closes sur materiel (journal et compte rendu plus bas) ; phase 3 (preflight qt3) : tests CPU verts sur materiel (run 20261027T080657Z), reste la validation GPU de la porte de format q8 ; phase 1 (spike) ouverte.
+**Status:** actif — phases 0, 2 et 3 closes sur materiel (journal et compte rendu plus bas) ; phase 3 : tests CPU verts (run 20261027T080657Z) et porte qt3 passee sur GPU avec decode complet (trunk q8 tp2, 54 tok @ 43.8 tok/s) ; phases 4-5 re-calibrees par le run (slicing et admission kernels deja fonctionnels sur l'artefact cible G256) ; phase 1 (spike) ouverte.
 **Auteur:** (agent)
 **Cree:** 2026-10-27
 **Specification:** `docs/plans/2026-10-27-qwen35-2gpu-q8-tools-mtp-spec.md` (absente du depot
@@ -272,6 +272,27 @@ admission fail-closed ; validation token-exacte PP-MTP vs mono-carte MTP.
     suffixe ` (hipError=0)` du message HipError dans l'attente qt53). Porte de sortie CPU
     de la phase atteinte ; reste la validation GPU : `run` du trunk q8 en tp2 doit
     depasser le message de format observe en phase 2.
+  - **2026-10-27 — Phase 3 CLOSE : porte qt3 passee sur GPU, decode complet** (run manuel
+    sous le verrou du plan, daemon isole via `HIPFIRE_DAEMON_BIN=$PWD/target/release/daemon` ;
+    l'installation `~/.hipfire/bin/daemon` etait perimee — vieille porte de format — et le
+    canari du pilote de tests l'a collationnee) :
+    `run ~/qwen3.8-27b.q8.hfq --tp 2 --max-seq 4096 --temp 0 --spec off "Hello"` —
+    `dense qwen TP load complete: 2 ranks, peer_access=true` ; tape whole-token TP2 (128
+    barriers) ; KV Q8 VMM par rang ; tous les kernels q8 admis (decode et prefill :
+    embedding/gemm_qkvza/gated_delta_net/gemm_q8_0_residual/gate_up/gemm_qkv/attention/gemv) ;
+    prefill + decode 54 tokens @ 43.8 tok/s, sortie textuelle coherente. Aucun fallback
+    silencieux, aucun refus de format.
+    Explication du passage sans phases 4-5 : les largeurs slicees de l'artefact (5120d,
+    vocab 248320, tout multiple de 256) traversent le slicing groupe-256 en dur de
+    `slice_uniform_group_cols` — arithmetiquement correct pour qt3 des que `k % 256 == 0`
+    (row_bytes = (k/256)*272 ; chaque tranche de 256 colonnes = 8 groupes qt3 alignes),
+    verifie par calcul sur les k de l'artefact.
+    Consequences : phase 4 se re-calibre en generalisation du groupe par format (qt3 G32
+    quelconque, utile pour les artefacts hors G256) + tests de layouts ; phase 5 est
+    largement couverte par ce run (decode + prefill court) — restent le prefill long
+    (chunks multiples, prompt >= 256 tokens) et la parite tp2-vs-mono (phase 7).
+    Debit indicatif : 43.8 tok/s vs baseline mq4 tp2 51.91 tok/s (-15.6 %, un seul run,
+    spec off — la receipt reste l'objet de la phase 7).
   - Protocole automatise : `scripts/phase3_preflight_tests.py` pilote la compilation
     (`cargo test -p hipfire-arch-qwen35 --no-run`) puis l'execution des tests (avec
     `--show-output` pour rendre les skips runtime comptables), sous le verrou GPU du plan,
