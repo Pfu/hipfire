@@ -95,7 +95,8 @@ def display_command(cmd: list[str], env_extra: dict[str, str] | None = None) -> 
 
 
 def run_step(args: argparse.Namespace, name: str, cmd: list[str], log_path: Path | None,
-             env_extra: dict[str, str] | None = None) -> StepResult:
+             env_extra: dict[str, str] | None = None,
+             acceptable_exits: tuple[int, ...] = (0,)) -> StepResult:
     full = ["flock", "-w", args.flock_wait, args.flock] + cmd
     displayed = display_command(full, env_extra)
     if args.dry_run:
@@ -116,8 +117,8 @@ def run_step(args: argparse.Namespace, name: str, cmd: list[str], log_path: Path
             f"$ {displayed}\n--- stdout ---\n{proc.stdout}\n--- stderr ---\n{proc.stderr}\n"
             f"--- exit {proc.returncode} ---\n"
         )
-    ok = proc.returncode == 0
-    detail = "" if ok else f"exit {proc.returncode}"
+    ok = proc.returncode in acceptable_exits
+    detail = "" if ok else f"exit {proc.returncode} (acceptes : {', '.join(map(str, acceptable_exits))})"
     print(f"[{'ok' if ok else 'FAIL'}] {name} ({displayed})")
     return StepResult(name, displayed, ok, proc.returncode, str(log_path) if log_path else None, detail)
 
@@ -133,6 +134,13 @@ def log_stdout(log_path: str | Path | None) -> str:
     if marker not in text:
         return ""
     return text.split(marker, 1)[1].split("\n--- stderr ---", 1)[0]
+
+
+def full_log(log_path: str | Path | None) -> str:
+    if log_path is None:
+        return ""
+    path = Path(log_path)
+    return path.read_text() if path.is_file() else ""
 
 
 def sha256_of(path: Path) -> str:
@@ -295,6 +303,7 @@ def build_report(context: dict[str, Any]) -> str:
     else:
         lines.append(f"- ligne : `{peer['line']}`")
         lines.append(f"- peer_access : {peer['peer_access']} ({peer['ranks']} ranks)")
+        lines.append(f"- source de la ligne : {peer.get('source', 'run-mq4-tp2')}")
     for line in context["peer_anomalies"]:
         lines.append(f"- anomalie : {line}")
     lines.append("")
@@ -440,19 +449,23 @@ def main() -> int:
                "--temp", "0", args.prompt]
     peer_run = run_step(args, "run-mq4-tp2", run_cmd, logs_dir / "run-mq4-tp2.log")
     steps.append(peer_run)
-    peer_text = log_stdout(peer_run.log_path) + "\n" + (
-        Path(peer_run.log_path).read_text().split("--- stderr ---", 1)[-1]
-        if peer_run.log_path and Path(peer_run.log_path).is_file() else "")
+    peer_text = full_log(peer_run.log_path)
     peer_access = extract_peer_access(peer_text)
+    peer_source = "run-mq4-tp2"
+    if peer_access is not None:
+        peer_access["source"] = peer_source
 
     mtp_cmd = run_cmd.copy()
     mtp_index = mtp_cmd.index("--tp")
     mtp_cmd[mtp_index:mtp_index] = ["--spec", "mtp"]
     mtp_run = run_step(args, "run-mq4-tp2-mtp", mtp_cmd, logs_dir / "run-mq4-tp2-mtp.log")
     steps.append(mtp_run)
-    mtp_text = log_stdout(mtp_run.log_path) + "\n" + (
-        Path(mtp_run.log_path).read_text().split("--- stderr ---", 1)[-1]
-        if mtp_run.log_path and Path(mtp_run.log_path).is_file() else "")
+    mtp_text = full_log(mtp_run.log_path)
+    if peer_access is None:
+        fallback = extract_peer_access(mtp_text)
+        if fallback is not None:
+            peer_access = fallback
+            fallback["source"] = "run-mq4-tp2-mtp (run sans --spec echoue avant le chargement complet)"
 
     baselines: dict[str, dict[str, Any]] = {}
     for config, env_extra in (("tp2", None), ("pp2", {"HIPFIRE_TOPOLOGY_PP": "2"})):
@@ -478,10 +491,16 @@ def main() -> int:
     if not args.dry_run:
         fit_step = run_step(args, "fit-mq4-tp2",
                             [str(hipfire), "fit", model_arg, "--tp", "2", "-j"],
-                            logs_dir / "fit-mq4-tp2.json.log")
+                            logs_dir / "fit-mq4-tp2.json.log", acceptable_exits=(0, 1, 2))
         steps.append(fit_step)
         if fit_step.ok:
-            fit_report = fit_machine(json.loads(log_stdout(fit_step.log_path) or "{}"))
+            stdout = log_stdout(fit_step.log_path).strip()
+            if stdout:
+                parsed_fit = json.loads(stdout)
+                fit_report = fit_machine(parsed_fit)
+                verdict = parsed_fit.get("verdict")
+                if verdict is not None:
+                    fit_step.detail = f"verdict={verdict} (exit fit {fit_step.exit_code})"
     if not fit_report:
         fit_report = {"devices": [], "ram_total": "n/a", "mem_available": "n/a",
                       "plan_topology": "n/a"}
@@ -491,7 +510,9 @@ def main() -> int:
     all_logs = "\n".join(path.read_text() for path in log_files)
     anomalies = sorted(set(anomaly_lines(all_logs)))
     steps_json = [{"name": step.name, "ok": step.ok, "exit_code": step.exit_code,
-                   "detail": step.detail} for step in steps]
+                   "detail": step.detail,
+                   "anomalies": anomaly_lines(full_log(step.log_path))}
+                  for step in steps]
     summary = {
         "timestamp": stamp,
         "binary_version": version_text,
@@ -533,9 +554,12 @@ def main() -> int:
         (run_dir / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
         print(f"\ncompte rendu : {run_dir / 'report.md'}")
         print(f"resume machine : {run_dir / 'summary.json'}")
-        failed = [step["name"] for step in steps_json if not step["ok"]]
+        failed = [step for step in steps if not step.ok]
         if failed:
-            print(f"etapes en echec : {', '.join(failed)}", file=sys.stderr)
+            print(f"etapes en echec : {', '.join(step.name for step in failed)}", file=sys.stderr)
+            for step in failed:
+                for line in anomaly_lines(full_log(step.log_path), limit=5):
+                    print(f"  [{step.name}] {line}", file=sys.stderr)
             return 1
     return 0
 
