@@ -1,9 +1,10 @@
 # Qwen3.5 (arch 5) — 2 GPU + tool_call + MTP en Q8 : plan d'implementation ordonne
 
-**Status:** draft — a valider avant la phase 1.
+**Status:** actif — phase 2 validee sur materiel (journal plus bas) ; phase 0 en attente d'execution.
 **Auteur:** (agent)
 **Cree:** 2026-10-27
-**Specification:** `docs/plans/2026-10-27-qwen35-2gpu-q8-tools-mtp-spec.md`
+**Specification:** `docs/plans/2026-10-27-qwen35-2gpu-q8-tools-mtp-spec.md` (absente du depot
+au 2026-10-27 : a creer ou rapatrier avant la phase 3)
 
 Ce plan est **ordonne par dependance**, pas par priorite percue : la phase 1 (spike) decide si la
 phase 5 coute peu ou beaucoup, et la phase 2 est la seule entierement parallelisable.
@@ -229,3 +230,26 @@ admission fail-closed ; validation token-exacte PP-MTP vs mono-carte MTP.
 - **Un refus reste un refus** : jamais de downgrade silencieux de format, de KV ou de topologie.
 - **Chaque phase est independamment annulable** : aucune ne doit laisser le depot dans un etat ou un
   load qui marchait avant echoue apres.
+
+---
+
+## Journal d'execution
+
+- **2026-10-27 — Phase 2 validee sur materiel** (implementation `af4cb2f62` ; 2x gfx1100 24 GiB,
+  PCIe 28.3 GB/s calibre, hote 123.4 GiB RAM, artefact `qwen3.8-27b.q8.hfq` 26.6 GiB arch 5,
+  `memory.max_seq` 32768) :
+  - `fit --tp 2` : `topology tp2`, verdict `UNDETERMINED` (capacite par rang decidee au load),
+    note `tp2: per-rank weights are not projected (the capacity projection is single-card)`.
+  - `fit` mono-carte : `DOES NOT FIT` (poids projetes 30.5 GiB > 23.9 GiB libres) — TP2 est la
+    seule route pour cet artefact.
+  - `fit --pp 2` : `topology pp2`, KV legacy (refus VMM sous PP, texte inchange) ;
+    `fit --tp 2 --pp 2` : refus d'exclusivite pp/tp (texte inchange) ; `--tp 0` / `--tp 65` :
+    erreur clap `1..=64`.
+  - `run --tp 2` : refus de format attendu au premier tenseur de projection GDN —
+    `layers.0.linear_attn.in_proj_qkv.weight: dense TP requires qt13 or qt44, got qt=3`
+    (`validate_mq4_proj_info`, `load.rs`). Tout l'amont fonctionne (deux cartes verifiees, locks
+    GPU pris, kernels precompiles trouves, KV q8/q8) : le blocage est la porte de format qt3,
+    objet des phases 3 a 5.
+- **Artefacts de phase 0 identifies** (dans `registry/v1.json`, arch 5) : trunk q8 local
+  `qwen3.8-27b.q8.hfq` ; reference mq4 du registre `qwen3.8:27b` -> `qwen3.8-27b.mq4` avec tete
+  MTP sidecar `qwen3.8-27b.mtp`. A telecharger et sceller (sha256) a l'execution de la phase 0.
