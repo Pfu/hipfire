@@ -32,7 +32,7 @@
 //!      etc. — the bare names from
 //!      hipfire-arch-qwen35/src/qwen35/load.rs `validate_*` preflight),
 //!      asserts qt == 44 (MQ4G256V2), reads M/K from the header shape
-//!      ([M, K] — enforced by `validate_mq4_proj_info`), and checks
+//!      ([M, K] — enforced by `validate_dense_proj_info`), and checks
 //!      data_size == M*K/256*136 (`expected_mq4_bytes`).
 //!   4. Uploads the REAL weight bytes, allocates finite-random F32 X [N*K]
 //!      and zeroed F32 Y [N*M], and times the exact production entry points

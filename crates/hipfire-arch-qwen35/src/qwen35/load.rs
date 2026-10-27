@@ -3607,10 +3607,37 @@ enum DenseTpSlice<'a> {
 
 const MQ4_G256_QT: u8 = 13;
 const MQ4V2_G256_QT: u8 = 44;
+const Q8_0_QT: u8 = 3;
+
+/// Group layout of a dense-TP-admissible projection weight format: MQ4
+/// keeps its 256-wide groups (136 B each), Q8_0 joins on its native
+/// 32-wide groups (34 B each).
+struct DenseProjFormat {
+    group: usize,
+    group_bytes: usize,
+}
+
+fn dense_proj_format(qt: u8) -> Option<DenseProjFormat> {
+    match qt {
+        MQ4_G256_QT | MQ4V2_G256_QT => Some(DenseProjFormat {
+            group: 256,
+            group_bytes: 136,
+        }),
+        Q8_0_QT => Some(DenseProjFormat {
+            group: 32,
+            group_bytes: 34,
+        }),
+        _ => None,
+    }
+}
 
 #[inline]
 fn is_dense_proj_qt(qt: u8) -> bool {
-    matches!(qt, MQ4_G256_QT | MQ4V2_G256_QT)
+    dense_proj_format(qt).is_some()
+}
+
+fn dense_tp_format_refusal(name: &str, qt: u8) -> String {
+    format!("{name}: dense TP requires qt13, qt44 or qt3, got qt={qt}")
 }
 
 fn find_qwen35_tensor<'a>(hfq: &'a HfqFile, bare: &str) -> Option<(&'a HfqTensorInfo, String)> {
@@ -3946,31 +3973,49 @@ pub(crate) fn reject_hfq_qt53_for_mode(hfq: &HfqFile, mode: &str) -> HipResult<(
     }
 }
 
-fn expected_mq4_bytes(m: usize, k: usize) -> Option<usize> {
-    if k % 256 != 0 {
+fn expected_grouped_bytes(
+    m: usize,
+    k: usize,
+    group: usize,
+    group_bytes: usize,
+) -> Option<usize> {
+    if k % group != 0 {
         return None;
     }
-    let gpr = k / 256;
-    m.checked_mul(gpr)?.checked_mul(136)
+    let gpr = k / group;
+    m.checked_mul(gpr)?.checked_mul(group_bytes)
 }
 
-fn validate_mq4_proj_info(
+fn expected_mq4_bytes(m: usize, k: usize) -> Option<usize> {
+    expected_grouped_bytes(m, k, 256, 136)
+}
+
+fn validate_dense_proj_info(
     info: &HfqTensorInfo,
     m: usize,
     k: usize,
     name: &str,
 ) -> Result<(), String> {
-    if !is_dense_proj_qt(info.quant_type) {
-        return Err(format!(
-            "{name}: dense TP requires qt13 or qt44, got qt={}",
-            info.quant_type
-        ));
-    }
-    if info.group_size != 256 {
-        return Err(format!(
-            "{name}: group_size must be 256, got {}",
-            info.group_size
-        ));
+    let Some(fmt) = dense_proj_format(info.quant_type) else {
+        return Err(dense_tp_format_refusal(name, info.quant_type));
+    };
+    match info.quant_type {
+        Q8_0_QT => {
+            if info.group_size != 32 {
+                return Err(format!(
+                    "{name}: Q8 group_size must be 32, got {}",
+                    info.group_size
+                ));
+            }
+        }
+        _ => {
+            if info.group_size != 256 {
+                return Err(format!(
+                    "{name}: group_size must be 256, got {}",
+                    info.group_size
+                ));
+            }
+        }
     }
     if info.shape != vec![m as u32, k as u32] {
         return Err(format!(
@@ -3978,8 +4023,8 @@ fn validate_mq4_proj_info(
             info.shape
         ));
     }
-    let expected =
-        expected_mq4_bytes(m, k).ok_or_else(|| format!("{name}: K={k} not multiple of 256"))?;
+    let expected = expected_grouped_bytes(m, k, fmt.group, fmt.group_bytes)
+        .ok_or_else(|| format!("{name}: K={k} not multiple of {}", fmt.group))?;
     if info.data_size != expected {
         return Err(format!(
             "{name}: blob length mismatch expected {expected}, got {}",
@@ -4254,15 +4299,17 @@ pub fn preflight_weights_dense_tp(
     let qkv_dim = 2 * key_dim + value_dim;
     let conv = config.conv_kernel_dim;
 
-    let validate_proj = |bare: &str, m: usize, k: usize| -> Result<(), String> {
+    let validate_proj = |bare: &str, m: usize, k: usize| -> Result<usize, String> {
         let (info, cand) = find_qwen35_tensor(hfq, bare)
             .ok_or_else(|| format!("preflight: missing tensor {bare}"))?;
-        validate_mq4_proj_info(info, m, k, bare)?;
-        if k % 256 != 0 {
-            return Err(format!("preflight: {bare} K={k} not G256 aligned"));
+        let fmt = dense_proj_format(info.quant_type)
+            .ok_or_else(|| dense_tp_format_refusal(bare, info.quant_type))?;
+        validate_dense_proj_info(info, m, k, bare)?;
+        if k % fmt.group != 0 {
+            return Err(format!("preflight: {bare} K={k} not G{} aligned", fmt.group));
         }
         validate_awq_sidecar(hfq, &cand, k)?;
-        Ok(())
+        Ok(fmt.group)
     };
     let validate_norm = |bare: &str, n: usize| -> Result<(), String> {
         let (info, _) = find_qwen35_tensor(hfq, bare)
@@ -4282,7 +4329,7 @@ pub fn preflight_weights_dense_tp(
     }
     validate_norm("norm.weight", dim)?;
     if let Some((info, cand)) = find_qwen35_tensor(hfq, "lm_head.weight") {
-        let ok = validate_mq4_proj_info(info, vocab, dim, "lm_head.weight")
+        let ok = validate_dense_proj_info(info, vocab, dim, "lm_head.weight")
             .or_else(|_| validate_embedding_info(info, vocab, dim, "lm_head.weight"));
         ok.map_err(|e| format!("preflight: lm_head: {e}"))?;
         validate_awq_sidecar(hfq, &cand, dim)?;
@@ -4301,20 +4348,20 @@ pub fn preflight_weights_dense_tp(
                 validate_proj(&format!("{p}.self_attn.q_proj.weight"), q_rows, dim)?;
                 validate_proj(&format!("{p}.self_attn.k_proj.weight"), kv_dim, dim)?;
                 validate_proj(&format!("{p}.self_attn.v_proj.weight"), kv_dim, dim)?;
-                validate_proj(&format!("{p}.self_attn.o_proj.weight"), dim, o_in)?;
+                let o_group = validate_proj(&format!("{p}.self_attn.o_proj.weight"), dim, o_in)?;
                 validate_norm(&format!("{p}.self_attn.q_norm.weight"), head_dim)?;
                 validate_norm(&format!("{p}.self_attn.k_norm.weight"), head_dim)?;
                 validate_proj(&format!("{p}.mlp.gate_proj.weight"), hidden, dim)?;
                 validate_proj(&format!("{p}.mlp.up_proj.weight"), hidden, dim)?;
-                validate_proj(&format!("{p}.mlp.down_proj.weight"), dim, hidden)?;
-                if o_in % 256 != 0 {
+                let ffn_group = validate_proj(&format!("{p}.mlp.down_proj.weight"), dim, hidden)?;
+                if o_in % o_group != 0 {
                     return Err(format!(
-                        "preflight: layer {idx} o_in {o_in} not G256 aligned"
+                        "preflight: layer {idx} o_in {o_in} not G{o_group} aligned"
                     ));
                 }
-                if hidden % 256 != 0 {
+                if hidden % ffn_group != 0 {
                     return Err(format!(
-                        "preflight: layer {idx} hidden {hidden} not G256 aligned"
+                        "preflight: layer {idx} hidden {hidden} not G{ffn_group} aligned"
                     ));
                 }
             }
@@ -4370,7 +4417,7 @@ fn load_weight_tensor_dense_tp(
         return Err(HipError::new(
             0,
             &format!(
-                "dense TP2 requires MQ4-G256 qt13 or MQ4V2 qt44, {candidate} has qt={quant_type}"
+                "dense TP2 requires MQ4-G256 qt13, MQ4V2 qt44 or Q8_0 qt3, {candidate} has qt={quant_type}"
             ),
         ));
     }
@@ -9976,5 +10023,442 @@ mod expert_iu4_load_tests {
                 .unwrap();
         assert_eq!(err, "alloc 512");
         assert_eq!(calls, [8192, 512]);
+    }
+}
+
+/// Dense-TP preflight format-gate tests (CPU-pure): tiny HFQ fixtures built
+/// with the runtime HFQM writer and run through `preflight_weights_dense_tp`
+/// on the tp2 layouts. Q8_0 (qt3) joins the admitted projection formats on
+/// its native G32 layout; MQ4 (qt13/qt44) refusals stay verbatim and qt53
+/// keeps its dedicated rejection. Fixture geometry satisfies the tp2 layout
+/// invariants (G256 hidden, G256-aligned Delta macro-units and local
+/// attention/FFN widths); the gate under test is the projection qt/group.
+#[cfg(test)]
+mod dense_tp_preflight_format_tests {
+    use super::*;
+    use crate::qwen35::config_from_hfq;
+    use hipfire_runtime::hfq::{write_hfqm_package_mem, HfqMemTensor};
+
+    const ARCH_ID: u32 = 5;
+    const TP: usize = 2;
+
+    const DIM: usize = 256;
+    const HIDDEN: usize = 512;
+    const N_HEADS: usize = 8;
+    const HEAD_DIM: usize = 64;
+    const N_KV: usize = 2;
+    const KEY_HEADS: usize = 4;
+    const KEY_HEAD_DIM: usize = 64;
+    const VALUE_HEADS: usize = 4;
+    const VALUE_HEAD_DIM: usize = 128;
+    const VOCAB: usize = 128;
+    const CONV: usize = 4;
+    const KEY_DIM: usize = KEY_HEADS * KEY_HEAD_DIM;
+    const VALUE_DIM: usize = VALUE_HEADS * VALUE_HEAD_DIM;
+    const QKV_DIM: usize = 2 * KEY_DIM + VALUE_DIM;
+    const KV_DIM: usize = N_KV * HEAD_DIM;
+    const Q_ROWS: usize = N_HEADS * HEAD_DIM * 2;
+    const O_IN: usize = N_HEADS * HEAD_DIM;
+
+    struct FixtureFile {
+        path: std::path::PathBuf,
+    }
+
+    impl FixtureFile {
+        fn write(label: &str, metadata_json: &str, tensors: &[HfqMemTensor]) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "hipfire-q35-preflight-{label}-{}.hfq",
+                std::process::id()
+            ));
+            write_hfqm_package_mem(&path, ARCH_ID, metadata_json, tensors)
+                .expect("write HFQ fixture");
+            FixtureFile { path }
+        }
+
+        fn open(&self) -> HfqFile {
+            HfqFile::open(&self.path).expect("open HFQ fixture")
+        }
+    }
+
+    impl Drop for FixtureFile {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+
+    fn fixture_metadata(dim: usize) -> String {
+        serde_json::json!({
+            "architecture": "qwen35",
+            "config": {
+                "hidden_size": dim,
+                "num_hidden_layers": 2,
+                "num_attention_heads": N_HEADS,
+                "num_key_value_heads": N_KV,
+                "head_dim": HEAD_DIM,
+                "vocab_size": VOCAB,
+                "intermediate_size": HIDDEN,
+                "rms_norm_eps": 1e-5,
+                "rope_parameters": {
+                    "rope_theta": 5000000.0,
+                    "mrope_interleaved": true,
+                    "mrope_section": [12, 13, 14]
+                },
+                "partial_rotary_factor": 0.5,
+                "linear_num_key_heads": KEY_HEADS,
+                "linear_num_value_heads": VALUE_HEADS,
+                "linear_key_head_dim": KEY_HEAD_DIM,
+                "linear_value_head_dim": VALUE_HEAD_DIM,
+                "linear_conv_kernel_dim": CONV,
+                "layer_types": ["linear_attention", "full_attention"],
+                "norm_topk_prob": false
+            }
+        })
+        .to_string()
+    }
+
+    fn tensor(name: &str, shape: Vec<u32>, qt: u8, group: u32, data: Vec<u8>) -> HfqMemTensor {
+        HfqMemTensor {
+            name: name.to_string(),
+            quant_type: qt,
+            shape,
+            group_size: group,
+            data,
+        }
+    }
+
+    fn f32_vector(name: &str, n: usize) -> HfqMemTensor {
+        tensor(name, vec![n as u32], 2, 0, vec![0u8; n * 4])
+    }
+
+    fn proj(name: &str, m: usize, k: usize, qt: u8, group: u32) -> HfqMemTensor {
+        let data = match dense_proj_format(qt) {
+            Some(fmt) if k % fmt.group == 0 => vec![0u8; m * (k / fmt.group) * fmt.group_bytes],
+            _ => vec![0u8; m * k * 4],
+        };
+        tensor(name, vec![m as u32, k as u32], qt, group, data)
+    }
+
+    fn fixture_tensors(
+        dim: usize,
+        proj_qt: u8,
+        proj_group: u32,
+        embed_qt: u8,
+        with_lm_head: bool,
+    ) -> Vec<HfqMemTensor> {
+        let (embed_group, embed_bytes) = match embed_qt {
+            Q8_0_QT => (32u32, (dim / 32) * 34),
+            MQ4_G256_QT | MQ4V2_G256_QT => (256u32, (dim / 256) * 136),
+            _ => (0u32, dim * 4),
+        };
+        let mut out = vec![tensor(
+            "embed_tokens.weight",
+            vec![VOCAB as u32, dim as u32],
+            embed_qt,
+            embed_group,
+            vec![0u8; VOCAB * embed_bytes],
+        )];
+        if with_lm_head {
+            out.push(proj("lm_head.weight", VOCAB, dim, proj_qt, proj_group));
+        }
+        let (l0, l1) = ("layers.0", "layers.1");
+        out.push(f32_vector(&format!("{l0}.input_layernorm.weight"), dim));
+        out.push(f32_vector(&format!("{l0}.post_attention_layernorm.weight"), dim));
+        out.push(proj(
+            &format!("{l0}.linear_attn.in_proj_qkv.weight"),
+            QKV_DIM,
+            dim,
+            proj_qt,
+            proj_group,
+        ));
+        out.push(proj(
+            &format!("{l0}.linear_attn.in_proj_z.weight"),
+            VALUE_DIM,
+            dim,
+            proj_qt,
+            proj_group,
+        ));
+        out.push(proj(
+            &format!("{l0}.linear_attn.in_proj_a.weight"),
+            VALUE_HEADS,
+            dim,
+            proj_qt,
+            proj_group,
+        ));
+        out.push(proj(
+            &format!("{l0}.linear_attn.in_proj_b.weight"),
+            VALUE_HEADS,
+            dim,
+            proj_qt,
+            proj_group,
+        ));
+        out.push(f32_vector(&format!("{l0}.linear_attn.A_log"), VALUE_HEADS));
+        out.push(f32_vector(&format!("{l0}.linear_attn.dt_bias"), VALUE_HEADS));
+        out.push(f32_vector(
+            &format!("{l0}.linear_attn.conv1d.weight"),
+            QKV_DIM * CONV,
+        ));
+        out.push(f32_vector(
+            &format!("{l0}.linear_attn.norm.weight"),
+            VALUE_HEAD_DIM,
+        ));
+        out.push(proj(
+            &format!("{l0}.linear_attn.out_proj.weight"),
+            dim,
+            VALUE_DIM,
+            proj_qt,
+            proj_group,
+        ));
+        out.push(proj(
+            &format!("{l0}.mlp.gate_proj.weight"),
+            HIDDEN,
+            dim,
+            proj_qt,
+            proj_group,
+        ));
+        out.push(proj(
+            &format!("{l0}.mlp.up_proj.weight"),
+            HIDDEN,
+            dim,
+            proj_qt,
+            proj_group,
+        ));
+        out.push(proj(
+            &format!("{l0}.mlp.down_proj.weight"),
+            dim,
+            HIDDEN,
+            proj_qt,
+            proj_group,
+        ));
+        out.push(f32_vector(&format!("{l1}.input_layernorm.weight"), dim));
+        out.push(f32_vector(&format!("{l1}.post_attention_layernorm.weight"), dim));
+        out.push(proj(
+            &format!("{l1}.self_attn.q_proj.weight"),
+            Q_ROWS,
+            dim,
+            proj_qt,
+            proj_group,
+        ));
+        out.push(proj(
+            &format!("{l1}.self_attn.k_proj.weight"),
+            KV_DIM,
+            dim,
+            proj_qt,
+            proj_group,
+        ));
+        out.push(proj(
+            &format!("{l1}.self_attn.v_proj.weight"),
+            KV_DIM,
+            dim,
+            proj_qt,
+            proj_group,
+        ));
+        out.push(proj(
+            &format!("{l1}.self_attn.o_proj.weight"),
+            dim,
+            O_IN,
+            proj_qt,
+            proj_group,
+        ));
+        out.push(f32_vector(&format!("{l1}.self_attn.q_norm.weight"), HEAD_DIM));
+        out.push(f32_vector(&format!("{l1}.self_attn.k_norm.weight"), HEAD_DIM));
+        out.push(proj(
+            &format!("{l1}.mlp.gate_proj.weight"),
+            HIDDEN,
+            dim,
+            proj_qt,
+            proj_group,
+        ));
+        out.push(proj(
+            &format!("{l1}.mlp.up_proj.weight"),
+            HIDDEN,
+            dim,
+            proj_qt,
+            proj_group,
+        ));
+        out.push(proj(
+            &format!("{l1}.mlp.down_proj.weight"),
+            dim,
+            HIDDEN,
+            proj_qt,
+            proj_group,
+        ));
+        out
+    }
+
+    fn preflight_tensors(
+        label: &str,
+        dim: usize,
+        tensors: Vec<HfqMemTensor>,
+    ) -> Result<(), String> {
+        let fixture = FixtureFile::write(label, &fixture_metadata(dim), &tensors);
+        let hfq = fixture.open();
+        let config = config_from_hfq(&hfq).expect("fixture config parses");
+        let shard = ShardConfig::new(TP, false, 0, ExpertAssign::Stride).expect("tp2 shard");
+        preflight_weights_dense_tp(&hfq, &config, &shard)
+    }
+
+    fn preflight_fixture(
+        label: &str,
+        dim: usize,
+        proj_qt: u8,
+        proj_group: u32,
+        embed_qt: u8,
+        with_lm_head: bool,
+    ) -> Result<(), String> {
+        preflight_tensors(
+            label,
+            dim,
+            fixture_tensors(dim, proj_qt, proj_group, embed_qt, with_lm_head),
+        )
+    }
+
+    #[test]
+    fn qt3_full_fixture_passes_dense_tp_preflight() {
+        assert_eq!(
+            preflight_fixture("qt3-accept", DIM, Q8_0_QT, 32, Q8_0_QT, true),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn qt13_qt44_fixtures_still_pass() {
+        assert_eq!(
+            preflight_fixture("qt13-accept", DIM, MQ4_G256_QT, 256, MQ4_G256_QT, true),
+            Ok(())
+        );
+        assert_eq!(
+            preflight_fixture("qt44-accept", DIM, MQ4V2_G256_QT, 256, MQ4V2_G256_QT, true),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn qt3_refuses_k_not_multiple_of_32() {
+        assert_eq!(
+            preflight_fixture("qt3-k48", 48, Q8_0_QT, 32, 2, false),
+            Err("layers.0.linear_attn.in_proj_qkv.weight: K=48 not multiple of 32".to_string())
+        );
+    }
+
+    #[test]
+    fn qt3_refuses_wrong_group_size() {
+        assert_eq!(
+            preflight_fixture("qt3-g64", DIM, Q8_0_QT, 64, Q8_0_QT, false),
+            Err(
+                "layers.0.linear_attn.in_proj_qkv.weight: Q8 group_size must be 32, got 64"
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn qt53_preflight_refusal_unchanged() {
+        assert_eq!(
+            preflight_fixture("qt53-preflight", DIM, QT_MQ4G128V2, 32, Q8_0_QT, false),
+            Err(
+                "preflight: qwen35: qt53 (MQ4G128V2) tensor 'layers.0.linear_attn.in_proj_qkv.weight' \
+                 is not supported by dense tensor-parallel loading; load it through the ordinary \
+                 single-device resident or host-mapped path"
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn qt13_refuses_k_not_multiple_of_256() {
+        assert_eq!(
+            preflight_fixture("qt13-k48", 48, MQ4_G256_QT, 256, 2, false),
+            Err("layers.0.linear_attn.in_proj_qkv.weight: K=48 not multiple of 256".to_string())
+        );
+    }
+
+    #[test]
+    fn qt13_group_size_message_unchanged() {
+        assert_eq!(
+            preflight_fixture("qt13-g128", DIM, MQ4_G256_QT, 128, MQ4_G256_QT, false),
+            Err(
+                "layers.0.linear_attn.in_proj_qkv.weight: group_size must be 256, got 128"
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn qt13_blob_length_message_unchanged() {
+        let mut tensors = fixture_tensors(DIM, MQ4_G256_QT, 256, MQ4_G256_QT, false);
+        let t = tensors
+            .iter_mut()
+            .find(|t| t.name == "layers.0.linear_attn.in_proj_qkv.weight")
+            .expect("in_proj_qkv tensor");
+        t.data.extend_from_slice(&[0u8; 8]);
+        let expected = QKV_DIM * (DIM / 256) * 136;
+        assert_eq!(
+            preflight_tensors("qt13-blob", DIM, tensors),
+            Err(format!(
+                "layers.0.linear_attn.in_proj_qkv.weight: \
+                 blob length mismatch expected {expected}, got {}",
+                expected + 8
+            ))
+        );
+    }
+
+    #[test]
+    fn qt13_shape_mismatch_message_unchanged() {
+        let mut tensors = fixture_tensors(DIM, MQ4_G256_QT, 256, MQ4_G256_QT, false);
+        let wrong_shape = vec![QKV_DIM as u32 - 1, DIM as u32];
+        let t = tensors
+            .iter_mut()
+            .find(|t| t.name == "layers.0.linear_attn.in_proj_qkv.weight")
+            .expect("in_proj_qkv tensor");
+        t.shape = wrong_shape.clone();
+        assert_eq!(
+            preflight_tensors("qt13-shape", DIM, tensors),
+            Err(format!(
+                "layers.0.linear_attn.in_proj_qkv.weight: \
+                 shape mismatch {wrong_shape:?} vs [{QKV_DIM} {DIM}]"
+            ))
+        );
+    }
+
+    #[test]
+    fn format_gate_names_all_admitted_formats() {
+        assert_eq!(
+            preflight_fixture("qt1-gate", DIM, 1, 0, 2, false),
+            Err(
+                "layers.0.linear_attn.in_proj_qkv.weight: dense TP requires qt13, qt44 or qt3, got qt=1"
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn dense_proj_validator_refuses_qt53_directly() {
+        let name = "layers.0.linear_attn.in_proj_qkv.weight";
+        let info = HfqTensorInfo {
+            name: name.to_string(),
+            quant_type: QT_MQ4G128V2,
+            shape: vec![QKV_DIM as u32, DIM as u32],
+            group_size: 32,
+            data_offset: 0,
+            data_size: QKV_DIM * (DIM / 32) * 34,
+        };
+        assert_eq!(
+            validate_dense_proj_info(&info, QKV_DIM, DIM, name),
+            Err(format!(
+                "{name}: dense TP requires qt13, qt44 or qt3, got qt={QT_MQ4G128V2}"
+            ))
+        );
+    }
+
+    #[test]
+    fn expected_bytes_follow_the_format_group() {
+        let (m, k) = (QKV_DIM, DIM);
+        assert_eq!(expected_mq4_bytes(m, k), Some(m * (k / 256) * 136));
+        assert_eq!(
+            expected_grouped_bytes(m, k, 32, 34),
+            Some(m * (k / 32) * 34)
+        );
+        assert_eq!(expected_grouped_bytes(m, 48, 32, 34), None);
+        assert_eq!(expected_grouped_bytes(m, 48, 256, 136), None);
     }
 }
