@@ -257,4 +257,8 @@ admission fail-closed ; validation token-exacte PP-MTP vs mono-carte MTP.
   sha256, peer access mq4 tp2, attache MTP, 3 processus frais de bench mq4 tp2 et pp2 via
   `HIPFIRE_TOPOLOGY_PP=2`, fit machine) sous le verrou GPU du plan, et produit
   `phase0-out/run-<ts>/report.md` + `summary.json` + logs bruts + JSON bench. `--dry-run`
-  affiche les commandes sans les executer ; `--skip-pull` evite de re-puller.
+  affiche les commandes sans les executer. **Aucun telechargement sans `--pull`** : les
+  artefacts deja presents dans models/ sont scelles tels quels (`--mq4-file` accepte tout
+  fichier mq4* installe, run/bench/fit passent par le chemin) ; sans artefact et sans
+  `--pull` le script refuse en listant les candidats. HF_TOKEN est lu par hipfire lui-meme
+  (sa presence est consignee, sa valeur jamais affichee).

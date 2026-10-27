@@ -10,9 +10,15 @@ sous `benches/`, et le compte rendu synthetise dans `report.md` accompagne de
 `summary.json`. Code retour 0 si toutes les etapes passent, 1 sinon, 2 en cas
 d'erreur d'usage.
 
+Le script ne telecharge jamais sans `--pull` : si l'artefact mq4 vise est deja present dans
+models/ il est scelle tel quel (mq4, mq4-xts, mq4-pro... au choix via --mq4-file), sinon le
+script refuse en listant les candidats trouves. LesTelechargements `--pull` passent par
+`hipfire pull`, qui lit lui-meme HF_TOKEN ; le script n'affiche jamais la valeur du jeton.
+
 Exemples :
   python3 scripts/phase0_reference.py
-  python3 scripts/phase0_reference.py --skip-pull --processes 3
+  python3 scripts/phase0_reference.py --mq4-file qwen3.8-27b.mq4-xts --processes 3
+  python3 scripts/phase0_reference.py --pull --processes 3
   python3 scripts/phase0_reference.py --dry-run
 """
 
@@ -75,7 +81,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-seq", type=int, default=4096, help="contexte des runs de peer access")
     parser.add_argument("--prompt", default="Hello", help="prompt des runs de peer access")
     parser.add_argument("--timeout", type=int, default=3600, help="timeout par commande en secondes")
-    parser.add_argument("--skip-pull", action="store_true", help="ne pas re-executer `hipfire pull`")
+    parser.add_argument("--pull", action="store_true",
+                        help="autoriser `hipfire pull` si l'artefact mq4 vise est absent "
+                             "(sans ce drapeau, jamais de telechargement)")
     parser.add_argument("--dry-run", action="store_true", help="afficher les commandes sans rien executer")
     return parser.parse_args()
 
@@ -270,6 +278,15 @@ def build_report(context: dict[str, Any]) -> str:
         size = artifact.get("size_bytes")
         size_text = f"{size / GIB:.2f} GiB" if isinstance(size, (int, float)) else "?"
         lines.append(f"- {name} : {artifact['path']} ({size_text}, sha256 {artifact.get('sha256')})")
+    pull = context["pull"]
+    lines.append(f"- telechargement : {pull['note']}")
+    token_text = "presente" if pull["hf_token_present"] else "absente"
+    lines.append(f"- HF_TOKEN : {token_text} (lue par hipfire lui-meme pour le depot HF "
+                 f"`{pull['repo'] or 'inconnu'}` ; valeur jamais affichee)")
+    if context["partials"]:
+        lines.append("- fichiers partiels presents dans models/ (pulls interrompus, non geres ici) :")
+        for name in context["partials"]:
+            lines.append(f"  - {name}")
     lines.append("")
     lines.append("## Peer access (run mq4 tp2)")
     peer = context["peer_access"]
@@ -356,16 +373,12 @@ def main() -> int:
     version_lines = [line for line in log_stdout(version.log_path).splitlines() if line.strip()]
     version_text = version_lines[0] if version_lines else ""
 
-    if args.skip_pull:
-        print("[skip] pull (--skip-pull)")
-    else:
-        steps.append(run_step(args, "pull", [str(hipfire), "pull", args.mq4_tag, "-y"],
-                              logs_dir / "pull.log"))
     show = run_step(args, "registry-show",
                     [str(hipfire), "registry", "show", args.mq4_tag, "-j"],
                     logs_dir / "registry-show.log")
     steps.append(show)
     mq4_name, mtp_name = args.mq4_file, args.mtp_file
+    repo = ""
     if not args.dry_run and show.ok:
         try:
             entry = json.loads(log_stdout(show.log_path) or "{}")
@@ -376,21 +389,43 @@ def main() -> int:
             mq4_name = mq4_name or entry.get("file")
             mtp_block = entry.get("mtp")
             mtp_name = mtp_name or (mtp_block.get("file") if isinstance(mtp_block, dict) else None)
-    mq4_path = mtp_path = None
-    if not args.dry_run:
-        if mq4_name:
-            mq4_path = models_dir() / mq4_name
-        if mtp_name is None and mq4_name:
-            mtp_name = str(Path(mq4_name).with_suffix(".mtp"))
-        if mtp_name:
-            mtp_path = models_dir() / mtp_name
+            repo = entry.get("repo") or ""
+    mq4_path = (models_dir() / mq4_name) if mq4_name else None
+    if mtp_name is None and mq4_name:
+        mtp_name = str(Path(mq4_name).with_suffix(".mtp"))
+    mtp_path = (models_dir() / mtp_name) if mtp_name else None
+
+    pull_note = "non execute (--pull absent) ; aucun telechargement"
+    pull_executed = False
+    hf_token_present = bool(os.environ.get("HF_TOKEN"))
+    if args.dry_run:
+        print("[dry-run] presence des artefacts verifiee seulement en execution reelle ; "
+              f"pull : {'serait execute (--pull)' if args.pull else 'jamais (--pull absent)'}")
+    elif mq4_path and mq4_path.is_file() and mtp_path and mtp_path.is_file():
+        pull_note = "artefacts deja presents ; aucun telechargement"
+        print(f"[skip] pull ({pull_note} : {mq4_path.name}, {mtp_path.name})")
+    elif args.pull:
+        steps.append(run_step(args, "pull", [str(hipfire), "pull", args.mq4_tag, "-y"],
+                              logs_dir / "pull.log"))
+        pull_executed = True
+        pull_note = f"execute via `hipfire pull {args.mq4_tag}` (depot HF : {repo or 'inconnu'})"
+        if not (mq4_path and mq4_path.is_file()):
+            print(f"fichier mq4 toujours absent apres pull : {mq4_path}", file=sys.stderr)
+            return 2
+    else:
+        print(f"artefact mq4 absent : {mq4_path} ; le script ne telecharge pas sans --pull",
+              file=sys.stderr)
+        for candidate in sorted(models_dir().glob("*.mq4*")):
+            print(f"  candidat : {candidate.name} ({candidate.stat().st_size / GIB:.2f} GiB) -> "
+                  f"relancez avec --mq4-file {candidate.name}", file=sys.stderr)
+        return 2
 
     artifacts: dict[str, dict[str, Any]] = {}
     if args.dry_run:
         artifacts["trunk_q8"] = {"path": str(trunk), "present": None}
-        artifacts["mq4"] = {"path": str(models_dir() / (mq4_name or f"<fichier de {args.mq4_tag}>")),
+        artifacts["mq4"] = {"path": str(mq4_path or models_dir() / f"<fichier de {args.mq4_tag}>"),
                             "present": None}
-        artifacts["mtp"] = {"path": str(models_dir() / (mtp_name or "<derive du registre>")),
+        artifacts["mtp"] = {"path": str(mtp_path or models_dir() / "<derive du registre>"),
                             "present": None}
     else:
         artifacts["trunk_q8"] = seal_artifact(trunk)
@@ -400,10 +435,7 @@ def main() -> int:
             status = "ok" if artifact.get("present") else "ABSENT"
             print(f"[{status}] {name}: {artifact['path']}")
 
-    if args.dry_run:
-        model_arg = str(models_dir() / (mq4_name or f"<fichier de {args.mq4_tag}>"))
-    else:
-        model_arg = str(mq4_path) if mq4_path else args.mq4_tag
+    model_arg = str(mq4_path) if mq4_path else str(models_dir() / f"<fichier de {args.mq4_tag}>")
     run_cmd = [str(hipfire), "run", model_arg, "--tp", "2", "--max-seq", str(args.max_seq),
                "--temp", "0", args.prompt]
     peer_run = run_step(args, "run-mq4-tp2", run_cmd, logs_dir / "run-mq4-tp2.log")
@@ -428,7 +460,7 @@ def main() -> int:
         for index in range(1, args.processes + 1):
             bench_path = benches_dir / f"p0-mq4-{config}-{index}.json"
             bench_log = logs_dir / f"bench-mq4-{config}-{index}.log"
-            bench_cmd = [str(hipfire), "bench", args.mq4_tag, "--tg", str(args.tg), "-j"]
+            bench_cmd = [str(hipfire), "bench", model_arg, "--tg", str(args.tg), "-j"]
             step = run_step(args, f"bench-mq4-{config}-{index}", bench_cmd, bench_log,
                             env_extra=env_extra)
             steps.append(step)
@@ -454,6 +486,7 @@ def main() -> int:
         fit_report = {"devices": [], "ram_total": "n/a", "mem_available": "n/a",
                       "plan_topology": "n/a"}
 
+    partials = sorted(models_dir().glob("*.part.*")) if not args.dry_run else []
     log_files = sorted(logs_dir.glob("*.log")) if logs_dir.is_dir() else []
     all_logs = "\n".join(path.read_text() for path in log_files)
     anomalies = sorted(set(anomaly_lines(all_logs)))
@@ -468,6 +501,9 @@ def main() -> int:
         "mtp_lines": lines_matching(mtp_text, "mtp"),
         "baselines": baselines,
         "fit_machine": fit_report,
+        "pull": {"executed": pull_executed, "note": pull_note,
+                 "hf_token_present": hf_token_present, "repo": repo},
+        "partials": [path.name for path in partials],
         "steps": steps_json,
     }
     report_text = build_report({
@@ -483,6 +519,8 @@ def main() -> int:
         "peer_anomalies": anomaly_lines(peer_text),
         "mtp_lines": summary["mtp_lines"],
         "mtp_anomalies": anomaly_lines(mtp_text),
+        "pull": summary["pull"],
+        "partials": summary["partials"],
         "baselines": baselines,
         "hipfire_env": {key: value for key, value in os.environ.items()
                         if key.startswith("HIPFIRE_")},
